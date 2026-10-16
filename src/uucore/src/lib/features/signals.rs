@@ -700,7 +700,7 @@ pub unsafe extern "C" fn capture_startup_state() {
 
 /// Initializes startup state capture. Call once at crate root level.
 #[macro_export]
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "lazy-startup")))]
 macro_rules! init_startup_state_capture {
     () => {
         #[cfg(not(target_vendor = "apple"))]
@@ -717,8 +717,10 @@ macro_rules! init_startup_state_capture {
     };
 }
 
+/// With `lazy-startup` (utilities linked into a host binary such as Bun), nothing runs
+/// before `main`: the host pays no startup cost and the state reads as "open, not ignored".
 #[macro_export]
-#[cfg(not(unix))]
+#[cfg(any(not(unix), feature = "lazy-startup"))]
 macro_rules! init_startup_state_capture {
     () => {};
 }

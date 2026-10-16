@@ -149,6 +149,8 @@ utmp-classic = { workspace = true, optional = true }
 default = ["signals"]
 # * non-default features
 backup-control = []
+# No .init_array constructor (see init_startup_state_capture!).
+lazy-startup = []
 colors = []
 diagnostics = ["dep:ariadne"]
 checksum = ["base64-simd", "quoting-style", "rustix/fs", "sum"]
