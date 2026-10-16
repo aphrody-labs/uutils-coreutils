@@ -141,13 +141,17 @@ const MAX_KTIME_T: Duration = if cfg!(target_os = "linux") {
 )))]
 mod timer {
     use super::MAX_KTIME_T;
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    use kernel_timer as timer_api;
+    #[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+    use libc as timer_api;
     use std::io;
     use std::ptr::null_mut;
     use std::time::Duration;
     #[cfg(any(target_os = "redox", target_os = "android"))]
     use timer_sys as libc; // Complements their libc bindings.
 
-    pub(super) struct Timer(libc::timer_t);
+    pub(super) struct Timer(timer_api::timer_t);
 
     impl Timer {
         pub(super) fn new() -> io::Result<Self> {
@@ -166,7 +170,7 @@ mod timer {
             let mut timer_id = MaybeUninit::zeroed();
             // SAFETY: All values are properly initialized.
             if unsafe {
-                libc::timer_create(
+                timer_api::timer_create(
                     libc::CLOCK_MONOTONIC,
                     sev.as_mut_ptr(),
                     timer_id.as_mut_ptr(),
@@ -193,7 +197,7 @@ mod timer {
             time.it_value.tv_nsec = timeout.subsec_nanos() as _;
 
             // SAFETY: All values are properly initialized.
-            if unsafe { libc::timer_settime(self.0, 0, &raw const time, null_mut()) } == -1 {
+            if unsafe { timer_api::timer_settime(self.0, 0, &raw const time, null_mut()) } == -1 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -202,7 +206,186 @@ mod timer {
 
     impl Drop for Timer {
         fn drop(&mut self) {
-            unsafe { libc::timer_delete(self.0) };
+            unsafe { timer_api::timer_delete(self.0) };
+        }
+    }
+
+    // Only this private SIGEV_SIGNAL timer uses kernel IDs. glibc's public timer IDs
+    // also support SIGEV_THREAD and must not be mixed with these integer handles.
+    #[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+    #[allow(non_camel_case_types)]
+    mod kernel_timer {
+        pub(super) type timer_t = libc::c_int;
+
+        /// # Safety
+        /// `event` must contain initialized SIGEV_SIGNAL data and `timer` must be writable.
+        pub(super) unsafe fn timer_create(
+            clock: libc::clockid_t,
+            event: *mut libc::sigevent,
+            timer: *mut timer_t,
+        ) -> libc::c_int {
+            // SAFETY: the caller provides initialized SIGEV_SIGNAL data and a writable kernel ID.
+            unsafe { libc::syscall(libc::SYS_timer_create, clock, event, timer) as libc::c_int }
+        }
+
+        /// # Safety
+        /// `time` must point to an initialized Linux64 timespec; `previous` is writable or null.
+        pub(super) unsafe fn timer_settime(
+            timer: timer_t,
+            flags: libc::c_int,
+            time: *const libc::itimerspec,
+            previous: *mut libc::itimerspec,
+        ) -> libc::c_int {
+            // SAFETY: Linux64 uses this timespec layout; both pointers obey timer_settime's contract.
+            unsafe {
+                libc::syscall(libc::SYS_timer_settime, timer, flags, time, previous) as libc::c_int
+            }
+        }
+
+        /// # Safety
+        /// The caller must own this timer ID, so it cannot delete another owner's timer.
+        pub(super) unsafe fn timer_delete(timer: timer_t) -> libc::c_int {
+            // SAFETY: the kernel validates the integer ID and reports invalid handles through errno.
+            unsafe { libc::syscall(libc::SYS_timer_delete, timer) as libc::c_int }
+        }
+    }
+
+    #[cfg(all(test, target_os = "linux", target_pointer_width = "64"))]
+    mod tests {
+        use super::super::{ChildExt, TimeoutRet, timeout_signal_set};
+        use super::Timer;
+        use nix::sys::signal::SigSet;
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        use std::time::Duration;
+
+        struct RestoreMask(SigSet);
+        impl Drop for RestoreMask {
+            fn drop(&mut self) {
+                let _ = self.0.thread_set_mask();
+            }
+        }
+
+        fn timer_count() -> usize {
+            std::fs::read_to_string("/proc/self/timers")
+                .unwrap()
+                .lines()
+                .filter(|line| line.starts_with("ID:"))
+                .count()
+        }
+
+        #[test]
+        fn linux_kernel_timer_lifecycle() {
+            let mode = std::env::var_os("UUTILS_KERNEL_TIMER_TEST");
+            if mode.is_none() {
+                let mut command = Command::new(std::env::current_exe().unwrap());
+                let name = concat!(module_path!(), "::linux_kernel_timer_lifecycle")
+                    .split_once("::")
+                    .unwrap()
+                    .1;
+                command
+                    .args(["--exact", name, "--nocapture", "--test-threads=1"])
+                    .env("UUTILS_KERNEL_TIMER_TEST", "probe")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let set = timeout_signal_set();
+                // SAFETY: sigprocmask is async-signal-safe; all test threads inherit the blocked set.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::sigprocmask(libc::SIG_BLOCK, set.as_ref(), std::ptr::null_mut())
+                            == 0
+                        {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::last_os_error())
+                        }
+                    });
+                }
+                let mut child = command.spawn().unwrap();
+                let mut stdout = child.stdout.take().unwrap();
+                let mut stderr = child.stderr.take().unwrap();
+                let (send, receive) = std::sync::mpsc::channel();
+                let reader = std::thread::spawn(move || {
+                    let mut output = String::new();
+                    stdout.read_to_string(&mut output).unwrap();
+                    stderr.read_to_string(&mut output).unwrap();
+                    let _ = send.send(output);
+                });
+                let output = receive.recv_timeout(Duration::from_secs(5));
+                if output.is_err() {
+                    // This Child remains unreaped here, so only our owned process can be terminated.
+                    let _ = child.kill();
+                }
+                let status = child.wait().unwrap();
+                reader.join().unwrap();
+                assert!(
+                    output.is_ok(),
+                    "isolated kernel timer gate exceeded its deadline"
+                );
+                let output = output.unwrap();
+                assert!(output.contains("KERNEL_TIMER_LIFECYCLE_OK"), "{output}");
+                assert!(status.success(), "{output}");
+                return;
+            }
+            let original = SigSet::thread_get_mask().unwrap();
+            let restore = RestoreMask(original);
+            let mut changed = SigSet::empty();
+            changed.add(nix::sys::signal::Signal::SIGWINCH);
+            if original.contains(nix::sys::signal::Signal::SIGWINCH) {
+                changed.thread_unblock().unwrap();
+            } else {
+                changed.thread_block().unwrap();
+            }
+            assert_ne!(
+                SigSet::thread_get_mask()
+                    .unwrap()
+                    .contains(nix::sys::signal::Signal::SIGWINCH),
+                original.contains(nix::sys::signal::Signal::SIGWINCH)
+            );
+            timeout_signal_set().thread_block().unwrap();
+            let baseline = timer_count();
+            let mut timer = Timer::new().unwrap();
+            let id = timer.0;
+            assert_eq!(timer_count(), baseline + 1);
+            assert!(
+                timer
+                    .timed_sigwait(Duration::from_millis(1))
+                    .unwrap()
+                    .is_none()
+            );
+            timer.arm(Duration::from_secs(30)).unwrap();
+            drop(timer);
+            assert_eq!(timer_count(), baseline);
+            assert_eq!(unsafe { libc::syscall(libc::SYS_timer_delete, id) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EINVAL)
+            );
+            let mut child = Command::new(std::env::current_exe().unwrap())
+                .arg("--help")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let result = child.wait_or_timeout(Duration::from_secs(2), false);
+            if !matches!(result, Ok(TimeoutRet::Exited(_))) {
+                let _ = child.kill();
+            }
+            let status = child.wait().unwrap();
+            assert!(matches!(result, Ok(TimeoutRet::Exited(status)) if status.success()));
+            assert!(status.success());
+            assert_eq!(timer_count(), baseline);
+            drop(restore);
+            let restored = SigSet::thread_get_mask().unwrap();
+            for signal in &timeout_signal_set() {
+                assert_eq!(restored.contains(signal), original.contains(signal));
+            }
+            assert_eq!(
+                restored.contains(nix::sys::signal::Signal::SIGWINCH),
+                original.contains(nix::sys::signal::Signal::SIGWINCH)
+            );
+            println!("KERNEL_TIMER_LIFECYCLE_OK");
         }
     }
 

@@ -1974,8 +1974,8 @@ mod fhs_tests {
         let prefix = TempDir::new().unwrap(); // e.g.  /tmp/xyz
         let bin_dir = prefix.path().join("bin"); //        /tmp/xyz/bin
         let share_dir = prefix.path().join("share").join("locales").join("cut"); // /tmp/xyz/share/locales/cut
-        std::fs::create_dir_all(&share_dir).unwrap();
-        std::fs::create_dir_all(&bin_dir).unwrap();
+        fs::create_dir_all(&share_dir).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
 
         // 2. Pretend the executable lives in <prefix>/bin
         let exe_dir = bin_dir.as_path();
