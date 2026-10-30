@@ -8,7 +8,7 @@
 use clap::{Arg, ArgAction, Command};
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Stdin, Stdout, Write, stdin, stdout};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Stdin, Stdout, Write, stdin, stdout};
 use std::num::IntErrorKind;
 use uucore::char_width::char_info_at;
 use uucore::display::Quotable;
@@ -201,8 +201,11 @@ fn expand_shortcuts(args: Vec<OsString>) -> Vec<OsString> {
 
     for arg in args {
         if let Some(arg) = arg.to_str() {
-            if arg.starts_with('-') && arg[1..].chars().all(is_digit_or_comma) {
-                arg[1..]
+            if let Some(shortcut) = arg
+                .strip_prefix('-')
+                .filter(|shortcut| !shortcut.is_empty() && shortcut.chars().all(is_digit_or_comma))
+            {
+                shortcut
                     .split(',')
                     .filter(|s| !s.is_empty())
                     .for_each(|s| processed_args.push(OsString::from(format!("--tabs={s}"))));
@@ -319,15 +322,13 @@ fn next_tabstop(tab_config: &TabConfig, col: usize) -> Option<usize> {
     let tabstops = &tab_config.tabstops;
 
     if tabstops.is_empty() {
-        return None;
-    }
-
-    if tabstops.len() == 1
-        && !matches!(tab_config.increment_size, Some(n) if n > 0)
-        && !matches!(tab_config.extend_size, Some(n) if n > 0)
+        None
+    } else if let [tabstop] = tabstops[..]
+        && !matches!(tab_config.increment_size, Some(1..))
+        && !matches!(tab_config.extend_size, Some(1..))
     {
         // Simple case: single tab stop, repeat at that interval
-        Some(tabstops[0] - col % tabstops[0])
+        Some(tabstop - col % tabstop)
     } else {
         // Find next larger tab
         if let Some(&next_tab) = tabstops.iter().find(|&&t| t > col) {
@@ -509,12 +510,15 @@ fn unexpand_buf(
     print_state: &mut PrintState,
 ) -> UResult<()> {
     // We can only fast forward if we don't need to calculate col/scol
-    if let Some(b'\n') = buf.last() {
+    if Some(&b'\n') == buf.last() {
         // Fast path: if we're not converting all spaces (-a flag not set)
-        // and the line doesn't start with spaces, just write it directly
+        // and the line doesn't start with spaces, just write it directly. In
+        // UTF-8 mode a leading multibyte char may be a blank, so it needs the
+        // general loop.
         if !options.aflag
-            && !buf.is_empty()
-            && ((buf[0] != b' ' && buf[0] != b'\t') || !print_state.leading)
+            && buf.first().is_some_and(|&b| {
+                !print_state.leading || (b != b' ' && b != b'\t' && (b.is_ascii() || !options.utf8))
+            })
         {
             write_tabs(output, tab_config, print_state, options.aflag)?;
             print_state.scol = print_state.col;
@@ -643,7 +647,6 @@ fn unexpand_file(
     options: &Options,
     lastcol: usize,
     tab_config: &TabConfig,
-    buf: &mut [u8],
 ) -> UResult<()> {
     let mut input = open(file)?;
     let mut print_state = PrintState {
@@ -654,23 +657,24 @@ fn unexpand_file(
         pending_wide: Vec::new(),
     };
 
-    while let n @ 1.. = input
-        .read(buf)
+    while let buf @ [_, ..] = input
+        .fill_buf()
         .map_err(|e| e.map_err_context(|| file.maybe_quote().to_string()) as Box<dyn UError>)?
     {
-        for line in buf[..n].split_inclusive(|b| *b == b'\n') {
+        for line in buf.split_inclusive(|b| *b == b'\n') {
             unexpand_buf(line, output, options, lastcol, tab_config, &mut print_state)?;
             if let Some(b'\n') = line.last() {
                 print_state.new_line();
             }
         }
+        let len = buf.len();
+        input.consume(len);
     }
     // write out anything remaining
     write_tabs(output, tab_config, &mut print_state, options.aflag)
 }
 
 fn unexpand(options: &Options) -> UResult<()> {
-    let mut buf = [0u8; 128];
     let mut output = BufWriter::new(stdout());
     let tab_config = &options.tab_config;
     let lastcol = if tab_config.tabstops.len() > 1
@@ -683,7 +687,7 @@ fn unexpand(options: &Options) -> UResult<()> {
     };
 
     for file in &options.files {
-        if let Err(e) = unexpand_file(file, &mut output, options, lastcol, tab_config, &mut buf) {
+        if let Err(e) = unexpand_file(file, &mut output, options, lastcol, tab_config) {
             show!(e);
             set_exit_code(1);
         }

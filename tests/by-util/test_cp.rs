@@ -3,16 +3,15 @@
 // For the full copyright and license information, please view the LICENSE
 // file that was distributed with this source code.
 
-// spell-checker:ignore (flags) reflink (fs) tmpfs (linux) filefrag rlimit Rlim Nofile clob btrfs neve ROOTDIR USERDIR outfile subvolume uufs xattrs ELOOP
+// spell-checker:ignore (flags) reflink (fs) tmpfs (linux) filefrag rlimit Rlim NOFILE FSIZE SIGXFSZ clob btrfs neve ROOTDIR USERDIR outfile subvolume uufs xattrs ELOOP
 // spell-checker:ignore bdfl hlsl IRWXO IRWXG nconfined matchpathcon libselinux-devel prwx doesnotexist reftests subdirs mksocket srwx dstlink mcstransd
 
-#[cfg(unix)]
 use rstest::rstest;
 use uucore::display::Quotable;
 #[cfg(all(feature = "selinux", any(target_os = "linux", target_os = "android")))]
 use uucore::selinux::get_getfattr_output;
 use uutests::util::TestScenario;
-use uutests::{at_and_ucmd, new_ucmd, path_concat, util_name};
+use uutests::{at_and_ucmd, new_ucmd, path, util_name};
 
 use std::fs::set_permissions;
 
@@ -39,7 +38,7 @@ use std::time::Duration;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[cfg(feature = "truncate")]
-use uutests::util::PATH;
+use uutests::util::path;
 
 static TEST_EXISTING_FILE: &str = "existing_file.txt";
 static TEST_HELLO_WORLD_SOURCE: &str = "hello_world.txt";
@@ -119,6 +118,162 @@ fn test_cp_verbose_write_error_is_reported() {
     // The copy itself should still succeed even though reporting it on
     // stdout failed.
     assert!(at.file_exists("dest_file"));
+}
+
+#[test]
+#[cfg(unix)]
+fn test_cp_symlink_relative_source_in_cwd() {
+    // The destination is in the current directory, with or without "./".
+    for dest in ["b2.txt", "./b2.txt"] {
+        let (at, mut ucmd) = at_and_ucmd!();
+        at.touch("b.txt");
+        ucmd.args(&["-s", "b.txt", dest]).succeeds();
+
+        assert!(at.is_symlink("b2.txt"), "with dest {dest}");
+        assert_eq!(at.read_symlink("b2.txt"), "b.txt", "with dest {dest}");
+    }
+}
+
+// The destination's parent is compared with the current directory by name
+// and then by device/inode, so a path that merely resolves to
+// the current directory is accepted.
+#[test]
+#[cfg(unix)]
+#[cfg_attr(
+    wasi_runner,
+    ignore = "WASI sandbox: '..' leaves the mapped guest root"
+)]
+fn test_cp_symlink_relative_source_dest_resolving_to_cwd() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.touch("b.txt");
+    let cwd_name = at.subdir.file_name().unwrap().to_str().unwrap().to_owned();
+    let dest = format!("../{cwd_name}/b2");
+
+    ucmd.args(&["-s", "b.txt", &dest]).succeeds();
+
+    assert!(at.is_symlink("b2"));
+}
+
+#[test]
+#[cfg(unix)]
+#[cfg_attr(
+    wasi_runner,
+    ignore = "WASI sandbox: symlink/hardlink capability restrictions cause dangling-symlink/same-file detection to differ"
+)]
+fn test_cp_symlink_relative_source_dest_in_symlink_to_cwd() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.touch("b.txt");
+    at.symlink_dir(".", "here");
+
+    ucmd.args(&["-s", "b.txt", "here/b2"]).succeeds();
+
+    assert!(at.is_symlink("b2"));
+}
+
+#[test]
+#[cfg(unix)]
+#[cfg_attr(
+    wasi_runner,
+    ignore = "WASI sandbox: absolute host tmpdir path is outside the mapped guest root, so cp cannot stat it"
+)]
+fn test_cp_symlink_absolute_source_into_subdir() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("sub");
+    at.touch("b.txt");
+    ucmd.args(&["-s", &at.plus_as_string("b.txt"), "sub"])
+        .succeeds();
+    assert!(at.is_symlink("sub/b.txt"));
+}
+
+// The check must run before an existing destination is removed or backed up,
+// otherwise a failed command still destroys data.
+#[test]
+#[cfg(unix)]
+fn test_cp_symlink_relative_source_outside_cwd_existing_dest() {
+    for extra in ["--remove-destination", "-b", "-f"] {
+        let (at, mut ucmd) = at_and_ucmd!();
+        at.touch("b.txt");
+        at.mkdir("sub");
+        at.write("sub/b.txt", "keep me");
+
+        ucmd.args(&["-s", extra, "b.txt", "sub"])
+            .fails_with_code(1)
+            .stderr_contains("can make relative symbolic links only in current directory");
+
+        assert!(!at.is_symlink("sub/b.txt"), "with {extra}");
+        assert_eq!(at.read("sub/b.txt"), "keep me", "with {extra}");
+        assert!(!at.file_exists("sub/b.txt~"), "with {extra}");
+    }
+}
+
+#[test]
+#[cfg(unix)]
+#[cfg_attr(
+    wasi_runner,
+    ignore = "WASI sandbox: symlink/hardlink capability restrictions cause dangling-symlink/same-file detection to differ"
+)]
+fn test_cp_symlink_relative_source_outside_cwd_existing_symlink_dest() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.touch("b.txt");
+    at.mkdir("sub");
+    at.touch("other");
+    at.symlink_file("other", "sub/b.txt");
+
+    ucmd.args(&["-s", "--remove-destination", "b.txt", "sub"])
+        .fails_with_code(1)
+        .stderr_contains("can make relative symbolic links only in current directory");
+
+    assert!(at.is_symlink("sub/b.txt"));
+    assert_eq!(at.read_symlink("sub/b.txt"), at.plus_as_string("other"));
+}
+
+// `cp -rs dir out` with a relative dir: every link would be created in `out`,
+// so refuse per file.
+#[test]
+#[cfg(unix)]
+fn test_cp_symlink_recursive_relative_dir_outside_cwd() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("dir");
+    at.touch("dir/a.txt");
+
+    ucmd.args(&["-rs", "dir", "out"])
+        .fails_with_code(1)
+        .stderr_contains("can make relative symbolic links only in current directory");
+
+    assert!(!at.is_symlink("out/a.txt"));
+}
+
+#[test]
+#[cfg(unix)]
+fn test_cp_symlink_recursive_relative_dir_into_existing_dir() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("dir");
+    at.touch("dir/a.txt");
+    at.mkdir("out");
+
+    ucmd.args(&["-rs", "dir", "out"])
+        .fails_with_code(1)
+        .stderr_contains("can make relative symbolic links only in current directory");
+
+    assert!(!at.is_symlink("out/dir/a.txt"));
+}
+
+#[test]
+#[cfg(unix)]
+#[cfg_attr(
+    wasi_runner,
+    ignore = "WASI sandbox: absolute host tmpdir path is outside the mapped guest root, so cp cannot stat it"
+)]
+fn test_cp_symlink_recursive_absolute_dir_into_subdir() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("dir");
+    at.touch("dir/a.txt");
+    at.mkdir("out");
+
+    ucmd.args(&["-rs", &at.plus_as_string("dir"), "out"])
+        .succeeds();
+
+    assert!(at.is_symlink("out/dir/a.txt"));
 }
 
 #[test]
@@ -531,7 +686,7 @@ fn test_cp_recursive_continues_after_skipped_file(#[case] arg: &str, #[case] suc
         .map(|entry| entry.unwrap().file_name().to_str().unwrap().to_owned())
         .collect::<Vec<_>>();
     let (skipped, copied) = (&order[0], &order[1]);
-    at.write(&format!("destination/source/{skipped}"), "old contents");
+    at.write(format!("destination/source/{skipped}"), "old contents");
 
     ucmd.args(&["-R", arg, "source", "destination"]);
     // Only the prompt reads stdin; writing to a cp that never reads it can fail.
@@ -548,12 +703,12 @@ fn test_cp_recursive_continues_after_skipped_file(#[case] arg: &str, #[case] suc
     }
 
     assert_eq!(
-        at.read(&format!("destination/source/{skipped}")),
+        at.read(format!("destination/source/{skipped}")),
         "old contents"
     );
     assert_eq!(
-        at.read(&format!("destination/source/{copied}")),
-        at.read(&format!("source/{copied}"))
+        at.read(format!("destination/source/{copied}")),
+        at.read(format!("source/{copied}"))
     );
 }
 
@@ -1369,20 +1524,40 @@ fn test_cp_arg_remove_destination() {
     assert_eq!(at.read(TEST_HELLO_WORLD_DEST), "Hello, World!\n");
 }
 
-#[test]
-fn test_cp_arg_backup() {
+#[rstest]
+#[case::short(&["-b"], Some("~"))]
+#[case::combined_short_flags(&["-vbL"], Some("~"))]
+#[case::long(&["--backup"], Some("~"))]
+#[case::suffix(&["-b", "--suffix", ".bak"], Some(".bak"))]
+#[case::suffix_implies_backup(&["--suffix", ".bak"], Some(".bak"))]
+#[case::suffix_hyphen_value(&["-b", "--suffix", "-v"], Some("-v"))]
+#[case::empty_suffix_nil(&["--backup=nil", "--suffix="], Some("~"))]
+#[case::empty_suffix_long(&["--backup", "--suffix="], Some("~"))]
+#[case::numbered_t(&["--backup=t"], Some(".~1~"))]
+#[case::numbered(&["--backup=numbered"], Some(".~1~"))]
+#[case::existing(&["--backup=existing"], Some("~"))]
+#[case::nil(&["--backup=nil"], Some("~"))]
+#[case::simple(&["--backup=simple"], Some("~"))]
+#[case::never(&["--backup=never"], Some("~"))]
+#[case::none(&["--backup=none"], None)]
+#[case::off(&["--backup=off"], None)]
+fn test_cp_backup_control(#[case] args: &[&str], #[case] backup_suffix: Option<&str>) {
     let (at, mut ucmd) = at_and_ucmd!();
 
     ucmd.arg(TEST_HELLO_WORLD_SOURCE)
+        .args(args)
         .arg(TEST_HOW_ARE_YOU_SOURCE)
-        .arg("-b")
-        .succeeds();
+        .succeeds()
+        .no_stderr();
 
     assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
-    assert_eq!(
-        at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}~")),
-        "How are you?\n"
-    );
+    match backup_suffix {
+        Some(suffix) => assert_eq!(
+            at.read(format!("{TEST_HOW_ARE_YOU_SOURCE}{suffix}")),
+            "How are you?\n"
+        ),
+        None => assert!(!at.file_exists(format!("{TEST_HOW_ARE_YOU_SOURCE}~"))),
+    }
 }
 
 #[test]
@@ -1434,111 +1609,6 @@ fn test_cp_arg_backup_with_dest_a_symlink_to_source() {
 }
 
 #[test]
-fn test_cp_arg_backup_with_other_args() {
-    let (at, mut ucmd) = at_and_ucmd!();
-
-    ucmd.arg(TEST_HELLO_WORLD_SOURCE)
-        .arg(TEST_HOW_ARE_YOU_SOURCE)
-        .arg("-vbL")
-        .succeeds();
-
-    assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
-    assert_eq!(
-        at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}~")),
-        "How are you?\n"
-    );
-}
-
-#[test]
-fn test_cp_arg_backup_arg_first() {
-    let (at, mut ucmd) = at_and_ucmd!();
-
-    ucmd.arg("--backup")
-        .arg(TEST_HELLO_WORLD_SOURCE)
-        .arg(TEST_HOW_ARE_YOU_SOURCE)
-        .succeeds();
-
-    assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
-    assert_eq!(
-        at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}~")),
-        "How are you?\n"
-    );
-}
-
-#[test]
-fn test_cp_arg_suffix() {
-    let (at, mut ucmd) = at_and_ucmd!();
-
-    ucmd.arg(TEST_HELLO_WORLD_SOURCE)
-        .arg("-b")
-        .arg("--suffix")
-        .arg(".bak")
-        .arg(TEST_HOW_ARE_YOU_SOURCE)
-        .succeeds();
-
-    assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
-    assert_eq!(
-        at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}.bak")),
-        "How are you?\n"
-    );
-}
-
-#[test]
-fn test_cp_arg_suffix_without_backup_option() {
-    let (at, mut ucmd) = at_and_ucmd!();
-
-    ucmd.arg(TEST_HELLO_WORLD_SOURCE)
-        .arg("--suffix")
-        .arg(".bak")
-        .arg(TEST_HOW_ARE_YOU_SOURCE)
-        .succeeds();
-
-    assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
-    assert_eq!(
-        at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}.bak")),
-        "How are you?\n"
-    );
-}
-
-#[test]
-fn test_cp_empty_backup_suffix_uses_default() {
-    for backup_arg in ["--backup=nil", "--backup"] {
-        let (at, mut ucmd) = at_and_ucmd!();
-
-        ucmd.arg(backup_arg)
-            .arg("--suffix=")
-            .arg(TEST_HELLO_WORLD_SOURCE)
-            .arg(TEST_HOW_ARE_YOU_SOURCE)
-            .succeeds()
-            .no_stderr();
-
-        assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
-        assert_eq!(
-            at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}~")),
-            "How are you?\n"
-        );
-    }
-}
-
-#[test]
-fn test_cp_arg_suffix_hyphen_value() {
-    let (at, mut ucmd) = at_and_ucmd!();
-
-    ucmd.arg(TEST_HELLO_WORLD_SOURCE)
-        .arg("-b")
-        .arg("--suffix")
-        .arg("-v")
-        .arg(TEST_HOW_ARE_YOU_SOURCE)
-        .succeeds();
-
-    assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
-    assert_eq!(
-        at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}-v")),
-        "How are you?\n"
-    );
-}
-
-#[test]
 fn test_cp_custom_backup_suffix_via_env() {
     let (at, mut ucmd) = at_and_ucmd!();
     let suffix = "super-suffix-of-the-century";
@@ -1552,58 +1622,7 @@ fn test_cp_custom_backup_suffix_via_env() {
 
     assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
     assert_eq!(
-        at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}{suffix}")),
-        "How are you?\n"
-    );
-}
-
-#[test]
-fn test_cp_backup_numbered_with_t() {
-    let (at, mut ucmd) = at_and_ucmd!();
-
-    ucmd.arg("--backup=t")
-        .arg(TEST_HELLO_WORLD_SOURCE)
-        .arg(TEST_HOW_ARE_YOU_SOURCE)
-        .succeeds()
-        .no_stderr();
-
-    assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
-    assert_eq!(
-        at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}.~1~")),
-        "How are you?\n"
-    );
-}
-
-#[test]
-fn test_cp_backup_numbered() {
-    let (at, mut ucmd) = at_and_ucmd!();
-
-    ucmd.arg("--backup=numbered")
-        .arg(TEST_HELLO_WORLD_SOURCE)
-        .arg(TEST_HOW_ARE_YOU_SOURCE)
-        .succeeds()
-        .no_stderr();
-
-    assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
-    assert_eq!(
-        at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}.~1~")),
-        "How are you?\n"
-    );
-}
-
-#[test]
-fn test_cp_backup_existing() {
-    let (at, mut ucmd) = at_and_ucmd!();
-
-    ucmd.arg("--backup=existing")
-        .arg(TEST_HELLO_WORLD_SOURCE)
-        .arg(TEST_HOW_ARE_YOU_SOURCE)
-        .succeeds()
-        .no_stderr();
-
-    assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
-    assert_eq!(
-        at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}~")),
+        at.read(format!("{TEST_HOW_ARE_YOU_SOURCE}{suffix}")),
         "How are you?\n"
     );
 }
@@ -1612,7 +1631,7 @@ fn test_cp_backup_existing() {
 #[cfg(unix)]
 fn test_cp_backup_existing_target_is_fifo() {
     let (at, mut ucmd) = at_and_ucmd!();
-    at.mkfifo(&format!("{TEST_HOW_ARE_YOU_SOURCE}~"));
+    at.mkfifo(format!("{TEST_HOW_ARE_YOU_SOURCE}~"));
 
     ucmd.arg("--backup=simple")
         .arg(TEST_HELLO_WORLD_SOURCE)
@@ -1622,37 +1641,22 @@ fn test_cp_backup_existing_target_is_fifo() {
         .no_stderr();
 
     assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
-    assert!(!at.is_fifo(&format!("{TEST_HOW_ARE_YOU_SOURCE}~")));
+    assert!(!at.is_fifo(format!("{TEST_HOW_ARE_YOU_SOURCE}~")));
     assert_eq!(
-        at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}~")),
+        at.read(format!("{TEST_HOW_ARE_YOU_SOURCE}~")),
         "How are you?\n"
     );
 }
 
-#[test]
-fn test_cp_backup_nil() {
-    let (at, mut ucmd) = at_and_ucmd!();
-
-    ucmd.arg("--backup=nil")
-        .arg(TEST_HELLO_WORLD_SOURCE)
-        .arg(TEST_HOW_ARE_YOU_SOURCE)
-        .succeeds()
-        .no_stderr();
-
-    assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
-    assert_eq!(
-        at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}~")),
-        "How are you?\n"
-    );
-}
-
-#[test]
-fn test_cp_numbered_if_existing_backup_existing() {
+#[rstest]
+#[case::existing("--backup=existing")]
+#[case::nil("--backup=nil")]
+fn test_cp_numbered_if_existing_backup(#[case] backup_arg: &str) {
     let (at, mut ucmd) = at_and_ucmd!();
     let existing_backup = &format!("{TEST_HOW_ARE_YOU_SOURCE}.~1~");
     at.touch(existing_backup);
 
-    ucmd.arg("--backup=existing")
+    ucmd.arg(backup_arg)
         .arg(TEST_HELLO_WORLD_SOURCE)
         .arg(TEST_HOW_ARE_YOU_SOURCE)
         .succeeds()
@@ -1661,44 +1665,7 @@ fn test_cp_numbered_if_existing_backup_existing() {
     assert!(at.file_exists(TEST_HOW_ARE_YOU_SOURCE));
     assert!(at.file_exists(existing_backup));
     assert_eq!(
-        at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}.~2~")),
-        "How are you?\n"
-    );
-}
-
-#[test]
-fn test_cp_numbered_if_existing_backup_nil() {
-    let (at, mut ucmd) = at_and_ucmd!();
-    let existing_backup = &format!("{TEST_HOW_ARE_YOU_SOURCE}.~1~");
-
-    at.touch(existing_backup);
-    ucmd.arg("--backup=nil")
-        .arg(TEST_HELLO_WORLD_SOURCE)
-        .arg(TEST_HOW_ARE_YOU_SOURCE)
-        .succeeds()
-        .no_stderr();
-
-    assert!(at.file_exists(TEST_HOW_ARE_YOU_SOURCE));
-    assert!(at.file_exists(existing_backup));
-    assert_eq!(
-        at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}.~2~")),
-        "How are you?\n"
-    );
-}
-
-#[test]
-fn test_cp_backup_simple() {
-    let (at, mut ucmd) = at_and_ucmd!();
-
-    ucmd.arg("--backup=simple")
-        .arg(TEST_HELLO_WORLD_SOURCE)
-        .arg(TEST_HOW_ARE_YOU_SOURCE)
-        .succeeds()
-        .no_stderr();
-
-    assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
-    assert_eq!(
-        at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}~")),
+        at.read(format!("{TEST_HOW_ARE_YOU_SOURCE}.~2~")),
         "How are you?\n"
     );
 }
@@ -1728,9 +1695,9 @@ fn test_cp_backup_simple_allows_hardlink_under_another_name() {
     // `other` shares an inode with the backup path but is not named after it,
     // so the backup rename cannot clobber it. GNU copies this happily.
     let (at, mut ucmd) = at_and_ucmd!();
-    let backup = format!("{TEST_HELLO_WORLD_SOURCE}~");
-    at.write(&backup, "backup content");
-    at.hard_link(&backup, "other");
+    let backup = &format!("{TEST_HELLO_WORLD_SOURCE}~");
+    at.write(backup, "backup content");
+    at.hard_link(backup, "other");
 
     ucmd.arg("--backup=simple")
         .arg("other")
@@ -1745,8 +1712,8 @@ fn test_cp_backup_simple_allows_hardlink_under_another_name() {
 fn test_cp_backup_simple_protect_source_regardless_of_spelling() {
     // The guard compares files, not the strings naming them.
     let (at, mut ucmd) = at_and_ucmd!();
-    let source = format!("{TEST_HELLO_WORLD_SOURCE}~");
-    at.write(&source, "source content");
+    let source = &format!("{TEST_HELLO_WORLD_SOURCE}~");
+    at.write(source, "source content");
 
     ucmd.arg("--backup=simple")
         .arg(format!("./{source}"))
@@ -1754,68 +1721,23 @@ fn test_cp_backup_simple_protect_source_regardless_of_spelling() {
         .fails()
         .stderr_contains("might destroy source");
 
-    assert_eq!(at.read(&source), "source content");
+    assert_eq!(at.read(source), "source content");
 }
 
 #[test]
 fn test_cp_backup_numbered_allows_source_named_like_backup() {
     // A numbered backup never reuses an existing name, so nothing is at risk.
     let (at, mut ucmd) = at_and_ucmd!();
-    let source = format!("{TEST_HELLO_WORLD_SOURCE}~");
-    at.write(&source, "source content");
+    let source = &format!("{TEST_HELLO_WORLD_SOURCE}~");
+    at.write(source, "source content");
 
     ucmd.arg("--backup=numbered")
-        .arg(&source)
+        .arg(source)
         .arg(TEST_HELLO_WORLD_SOURCE)
         .succeeds();
 
-    assert_eq!(at.read(&source), "source content");
+    assert_eq!(at.read(source), "source content");
     assert_eq!(at.read(TEST_HELLO_WORLD_SOURCE), "source content");
-}
-
-#[test]
-fn test_cp_backup_never() {
-    let (at, mut ucmd) = at_and_ucmd!();
-
-    ucmd.arg("--backup=never")
-        .arg(TEST_HELLO_WORLD_SOURCE)
-        .arg(TEST_HOW_ARE_YOU_SOURCE)
-        .succeeds()
-        .no_stderr();
-
-    assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
-    assert_eq!(
-        at.read(&format!("{TEST_HOW_ARE_YOU_SOURCE}~")),
-        "How are you?\n"
-    );
-}
-
-#[test]
-fn test_cp_backup_none() {
-    let (at, mut ucmd) = at_and_ucmd!();
-
-    ucmd.arg("--backup=none")
-        .arg(TEST_HELLO_WORLD_SOURCE)
-        .arg(TEST_HOW_ARE_YOU_SOURCE)
-        .succeeds()
-        .no_stderr();
-
-    assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
-    assert!(!at.file_exists(format!("{TEST_HOW_ARE_YOU_SOURCE}~")));
-}
-
-#[test]
-fn test_cp_backup_off() {
-    let (at, mut ucmd) = at_and_ucmd!();
-
-    ucmd.arg("--backup=off")
-        .arg(TEST_HELLO_WORLD_SOURCE)
-        .arg(TEST_HOW_ARE_YOU_SOURCE)
-        .succeeds()
-        .no_stderr();
-
-    assert_eq!(at.read(TEST_HOW_ARE_YOU_SOURCE), "Hello, World!\n");
-    assert!(!at.file_exists(format!("{TEST_HOW_ARE_YOU_SOURCE}~")));
 }
 
 #[test]
@@ -1905,7 +1827,7 @@ fn test_cp_no_deref() {
         .join(TEST_HELLO_WORLD_SOURCE_SYMLINK);
     assert!(
         at.is_symlink(
-            &path_to_new_symlink
+            path_to_new_symlink
                 .clone()
                 .into_os_string()
                 .into_string()
@@ -1989,7 +1911,7 @@ fn test_cp_parents() {
         .succeeds();
 
     assert_eq!(
-        at.read(&format!(
+        at.read(format!(
             "{TEST_COPY_TO_FOLDER}/{TEST_COPY_FROM_FOLDER_FILE}"
         )),
         "Hello, World!\n"
@@ -2007,13 +1929,13 @@ fn test_cp_parents_multiple_files() {
         .succeeds();
 
     assert_eq!(
-        at.read(&format!(
+        at.read(format!(
             "{TEST_COPY_TO_FOLDER}/{TEST_COPY_FROM_FOLDER_FILE}"
         )),
         "Hello, World!\n"
     );
     assert_eq!(
-        at.read(&format!("{TEST_COPY_TO_FOLDER}/{TEST_HOW_ARE_YOU_SOURCE}")),
+        at.read(format!("{TEST_COPY_TO_FOLDER}/{TEST_HOW_ARE_YOU_SOURCE}")),
         "How are you?\n"
     );
 }
@@ -2118,6 +2040,187 @@ fn test_cp_parents_with_permissions_copy_dir() {
         assert_metadata_eq!(p2_metadata, at.metadata("dir/p1/p2"));
         assert_metadata_eq!(file_metadata, at.metadata("dir/p1/p2/file"));
     }
+}
+
+#[test]
+#[cfg(unix)]
+#[cfg_attr(
+    wasi_runner,
+    ignore = "WASI: no chmod syscall, so source modes cannot be set up"
+)]
+fn test_cp_parents_created_dirs_take_source_mode() {
+    // Without -p, a directory that --parents creates gets the mode of the
+    // source directory it stands for, filtered through the umask, whether
+    // the operand is a file or a directory. --no-preserve=mode gives it the
+    // default mode instead.
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.mkdir_all("a/b/sub");
+    at.touch("a/b/f");
+    at.touch("a/b/sub/f");
+    at.mkdir("ro");
+    at.touch("ro/f");
+    at.set_mode("a", 0o777);
+    at.set_mode("a/b", 0o700);
+    at.set_mode("ro", 0o500);
+    for dest in ["file", "dir", "default"] {
+        at.mkdir(dest);
+    }
+
+    scene
+        .ucmd()
+        .umask(0o022)
+        .args(&["--parents", "a/b/f", "ro/f", "file"])
+        .succeeds();
+    scene
+        .ucmd()
+        .umask(0o022)
+        .args(&["-r", "--parents", "a/b/sub", "dir"])
+        .succeeds();
+    scene
+        .ucmd()
+        .umask(0o022)
+        .args(&["--parents", "--no-preserve=mode", "a/b/f", "default"])
+        .succeeds();
+
+    for (path, mode) in [
+        ("file/a", 0o755),
+        ("file/a/b", 0o700),
+        // Created writable for the copy, then given the source's mode.
+        ("file/ro", 0o500),
+        ("dir/a", 0o755),
+        ("dir/a/b", 0o700),
+        ("default/a", 0o755),
+        ("default/a/b", 0o755),
+    ] {
+        assert_eq!(
+            at.metadata(path).permissions().mode() & 0o7777,
+            mode,
+            "{path}"
+        );
+    }
+    assert!(at.file_exists("file/ro/f"));
+}
+
+#[test]
+#[cfg(unix)]
+#[cfg_attr(
+    wasi_runner,
+    ignore = "WASI: no chmod syscall, so source modes cannot be set up"
+)]
+fn test_cp_parents_existing_dirs() {
+    // Directories already in the destination keep their attributes when
+    // --parents has nothing to create. Once it creates one, -a/-p refreshes
+    // the whole path from the source, existing directories included, while a
+    // copy that does not preserve the mode still leaves them alone.
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.mkdir_all("a/b/sub");
+    at.mkdir("a/sub");
+    at.touch("a/f");
+    at.touch("a/b/f");
+    at.touch("a/sub/f");
+    at.set_mode("a", 0o777);
+    at.set_mode("a/b", 0o750);
+    for dest in ["none_file", "none_dir", "new_file", "new_dir", "new_plain"] {
+        at.mkdir_all(format!("{dest}/a"));
+        at.set_mode(format!("{dest}/a"), 0o700);
+    }
+
+    for args in [
+        &["-a", "--parents", "a/f", "none_file"][..],
+        &["-a", "-r", "--parents", "a/sub", "none_dir"],
+        &["-a", "--parents", "a/b/f", "new_file"],
+        &["-a", "-r", "--parents", "a/b/sub", "new_dir"],
+        &["--parents", "a/b/f", "new_plain"],
+    ] {
+        scene.ucmd().umask(0o022).args(args).succeeds();
+    }
+
+    for (path, mode) in [
+        ("none_file/a", 0o700),
+        ("none_dir/a", 0o700),
+        ("new_file/a", 0o777),
+        ("new_file/a/b", 0o750),
+        ("new_dir/a", 0o777),
+        ("new_dir/a/b", 0o750),
+        ("new_plain/a", 0o700),
+        ("new_plain/a/b", 0o750),
+    ] {
+        assert_eq!(
+            at.metadata(path).permissions().mode() & 0o7777,
+            mode,
+            "{path}"
+        );
+    }
+}
+
+#[test]
+#[cfg(unix)]
+#[cfg_attr(
+    wasi_runner,
+    ignore = "WASI: no chmod syscall, so source modes cannot be set up"
+)]
+fn test_cp_parents_dirs_take_source_mode_when_copy_fails() {
+    // The --parents directories still get the source's mode when the copy
+    // stops part-way, and when a directory above the working directory is
+    // not searchable, so the source ancestors have no realpath.
+    if rustix::process::geteuid().is_root() {
+        return; // root ignores the permissions this relies on
+    }
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.mkdir_all("p/w/a/b/sub");
+    at.mkdir("p/w/file");
+    at.mkdir("p/w/dir");
+    at.touch("p/w/a/b/f");
+    at.touch("p/w/a/b/sub/secret");
+    at.set_mode("p/w/a/b/sub/secret", 0);
+    at.set_mode("p/w/a", 0o750);
+    at.set_mode("p/w/a/b", 0o705);
+
+    // -d makes the unreadable file fatal, so the copy stops early.
+    scene
+        .ucmd()
+        .current_dir(at.plus("p/w"))
+        .umask(0o022)
+        .args(&["-r", "-d", "--parents", "a/b/sub", "dir"])
+        .fails();
+    scene
+        .cmd("sh")
+        .current_dir(at.plus("p/w"))
+        .umask(0o022)
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .args(&[
+            "-c",
+            "chmod 0 .. && \"$0\" cp --parents a/b/f file; s=$?; chmod 755 ..; exit $s",
+        ])
+        .arg(&scene.bin_path)
+        .succeeds();
+
+    for (path, mode) in [
+        ("p/w/dir/a", 0o750),
+        ("p/w/dir/a/b", 0o705),
+        ("p/w/file/a", 0o750),
+        ("p/w/file/a/b", 0o705),
+    ] {
+        assert_eq!(
+            at.metadata(path).permissions().mode() & 0o7777,
+            mode,
+            "{path}"
+        );
+    }
+    assert!(at.file_exists("p/w/file/a/b/f"));
+}
+
+#[test]
+fn test_cp_parents_failed_source_creates_nothing() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.touch("f");
+    at.mkdir("d");
+    ucmd.args(&["--parents", "f/g", "missing/x", "d"]).fails();
+    assert!(!at.dir_exists("d/f"));
+    assert!(!at.dir_exists("d/missing"));
 }
 
 #[test]
@@ -2611,12 +2714,8 @@ fn test_cp_deref_folder_to_folder() {
     let path_to_new_symlink = at.plus(TEST_COPY_FROM_FOLDER);
 
     at.symlink_file(
-        &path_to_new_symlink
-            .join(TEST_HELLO_WORLD_SOURCE)
-            .to_string_lossy(),
-        &path_to_new_symlink
-            .join(TEST_HELLO_WORLD_SOURCE_SYMLINK)
-            .to_string_lossy(),
+        path_to_new_symlink.join(TEST_HELLO_WORLD_SOURCE),
+        path_to_new_symlink.join(TEST_HELLO_WORLD_SOURCE_SYMLINK),
     );
 
     //using -P -R option
@@ -2713,12 +2812,8 @@ fn test_cp_no_deref_folder_to_folder() {
     let path_to_new_symlink = at.plus(TEST_COPY_FROM_FOLDER);
 
     at.symlink_file(
-        &path_to_new_symlink
-            .join(TEST_HELLO_WORLD_SOURCE)
-            .to_string_lossy(),
-        &path_to_new_symlink
-            .join(TEST_HELLO_WORLD_SOURCE_SYMLINK)
-            .to_string_lossy(),
+        path_to_new_symlink.join(TEST_HELLO_WORLD_SOURCE),
+        path_to_new_symlink.join(TEST_HELLO_WORLD_SOURCE_SYMLINK),
     );
 
     //using -P -R option
@@ -2781,7 +2876,7 @@ fn test_cp_no_deref_folder_to_folder() {
         .join(TEST_HELLO_WORLD_SOURCE_SYMLINK);
     assert!(
         at.is_symlink(
-            &path_to_new_symlink
+            path_to_new_symlink
                 .clone()
                 .into_os_string()
                 .into_string()
@@ -2863,8 +2958,8 @@ fn test_cp_archive_recursive() {
     at.touch(file_1);
     at.touch(file_2);
 
-    at.symlink_file("1", &file_1_link.to_string_lossy());
-    at.symlink_file("2", &file_2_link.to_string_lossy());
+    at.symlink_file("1", &file_1_link);
+    at.symlink_file("2", &file_2_link);
 
     ucmd.arg("--archive")
         .arg(TEST_COPY_TO_FOLDER)
@@ -2890,22 +2985,8 @@ fn test_cp_archive_recursive() {
     assert!(at.file_exists(at.subdir.join(TEST_COPY_TO_FOLDER_NEW).join("1")));
     assert!(at.file_exists(at.subdir.join(TEST_COPY_TO_FOLDER_NEW).join("2")));
 
-    assert!(
-        at.is_symlink(
-            &at.subdir
-                .join(TEST_COPY_TO_FOLDER_NEW)
-                .join("1.link")
-                .to_string_lossy()
-        )
-    );
-    assert!(
-        at.is_symlink(
-            &at.subdir
-                .join(TEST_COPY_TO_FOLDER_NEW)
-                .join("2.link")
-                .to_string_lossy()
-        )
-    );
+    assert!(at.is_symlink(at.subdir.join(TEST_COPY_TO_FOLDER_NEW).join("1.link")));
+    assert!(at.is_symlink(at.subdir.join(TEST_COPY_TO_FOLDER_NEW).join("2.link")));
 }
 
 #[test]
@@ -3086,7 +3167,7 @@ fn test_cp_one_file_system() {
 
     // Prepare the mount
     at_src.mkdir(TEST_MOUNT_MOUNTPOINT);
-    let mountpoint_path = &at_src.plus_as_string(TEST_MOUNT_MOUNTPOINT);
+    let mountpoint_path = &at_src.plus(TEST_MOUNT_MOUNTPOINT);
 
     scene
         .mount_temp_fs(mountpoint_path)
@@ -3267,7 +3348,7 @@ fn test_cp_reflink_insufficient_permission() {
 #[cfg(target_os = "linux")]
 #[test]
 fn test_closes_file_descriptors() {
-    use rustix::process::Resource;
+    use rlimit::Resource;
 
     let pid = std::process::id();
     let fd_path = format!("/proc/{pid}/fd");
@@ -3287,13 +3368,39 @@ fn test_closes_file_descriptors() {
         .arg("--reflink=auto")
         .arg("dir_with_10_files/")
         .arg("dir_with_10_files_new/")
-        .limit(Resource::Nofile, limit_fd, limit_fd)
+        .limit(Resource::NOFILE, limit_fd, limit_fd)
         .succeeds();
 }
 
+// When writing one file fails part-way, the rest of its data must not end up
+// in the files copied after it.
 #[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(not(wasi_runner))] // linux specific
 #[test]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
+fn test_cp_failed_write_does_not_spill_into_next_file() {
+    use rlimit::Resource;
+
+    const CAP: u64 = 100 * 1024;
+
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.write_bytes("big", &vec![b'x'; 3 * CAP as usize]);
+    at.write("small", "small file\n");
+    at.write("small2", "another small file\n");
+    at.mkdir("out");
+    ucmd.args(&["--reflink=never", "big", "small", "small2", "out"])
+        .limit(Resource::FSIZE, CAP, CAP)
+        .ignore_sigxfsz()
+        .fails()
+        .stderr_contains("'big'");
+
+    assert_eq!(at.metadata("out/big").len(), CAP);
+    assert_eq!(at.read("out/small"), "small file\n");
+    assert_eq!(at.read("out/small2"), "another small file\n");
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(not(wasi_runner))] // linux specific
+#[test]
 fn test_cp_sparse_never_empty() {
     const BUFFER_SIZE: usize = 4096 * 4;
     let (at, mut ucmd) = at_and_ucmd!();
@@ -3631,7 +3738,7 @@ fn test_cp_reflink_always_override() {
 
     if !scene
         .cmd("env")
-        .env("PATH", PATH)
+        .env("PATH", path())
         .args(&["mkfs.btrfs", "--rootdir", ROOTDIR, DISK])
         .run()
         .succeeded()
@@ -3644,7 +3751,7 @@ fn test_cp_reflink_always_override() {
 
     let mount = scene
         .cmd("sudo")
-        .env("PATH", PATH)
+        .env("PATH", path())
         .args(&["-E", "--non-interactive", "mount", DISK, MOUNTPOINT])
         .run();
 
@@ -3671,7 +3778,7 @@ fn test_cp_reflink_always_override() {
 
     scene
         .cmd("sudo")
-        .env("PATH", PATH)
+        .env("PATH", path())
         .args(&["-E", "--non-interactive", "umount", MOUNTPOINT])
         .succeeds();
 }
@@ -3798,8 +3905,8 @@ fn test_preserve_mode() {
 fn test_canonicalize_symlink() {
     let (at, mut ucmd) = at_and_ucmd!();
     at.mkdir("dir");
-    at.touch("dir/file");
-    at.relative_symlink_file("../dir/file", "dir/file-ln");
+    at.touch(path!("dir", "file"));
+    at.relative_symlink_file(path!("..", "dir", "file"), path!("dir", "file-ln"));
     ucmd.arg("dir/file-ln").arg(".").succeeds().no_output();
 }
 
@@ -3810,8 +3917,12 @@ fn test_copy_through_just_created_symlink() {
         at.mkdir("a");
         at.mkdir("b");
         at.mkdir("c");
-        at.relative_symlink_file("../t", "a/1");
-        at.write("b/1", "hello");
+        let parent_t = path!("..", "t");
+        let a_one = path!("a", "1");
+        let b_one = path!("b", "1");
+
+        at.relative_symlink_file(parent_t, a_one);
+        at.write(b_one, "hello");
         if create_t {
             at.write("t", "world");
         }
@@ -4363,7 +4474,49 @@ fn test_cp_dir_vs_file() {
         .arg(TEST_COPY_FROM_FOLDER)
         .arg(TEST_EXISTING_FILE)
         .fails()
-        .stderr_only("cp: cannot overwrite non-directory with directory\n");
+        .stderr_only(format!(
+            "cp: cannot overwrite non-directory '{TEST_EXISTING_FILE}' with directory '{TEST_COPY_FROM_FOLDER}'\n"
+        ));
+}
+
+#[test]
+#[cfg(unix)]
+fn test_cp_dir_vs_dangling_symlink() {
+    // A symlink that leads nowhere is not a directory to copy into: following
+    // it would create its target.
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("src");
+    at.touch("src/file");
+    at.symlink_file("nowhere", "dangling");
+
+    ucmd.args(&["-r", "src", "dangling"])
+        .fails()
+        .stderr_only("cp: cannot overwrite non-directory 'dangling' with directory 'src'\n");
+    assert!(!at.dir_exists("nowhere"));
+}
+
+#[test]
+fn test_cp_recursive_dest_subdir_is_file() {
+    // A directory whose destination already exists as a file is reported
+    // and left alone; the other entries are still copied.
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir_all("src/sub");
+    at.write("src/sub/x", "x");
+    at.write("src/other", "other");
+    at.mkdir_all("dst/src");
+    at.write("dst/src/sub", "kept");
+
+    let dest = path!("dst", "src", "sub");
+    let source = path!("src", "sub");
+    ucmd.args(&["-r", "src", "dst"])
+        .fails()
+        .stderr_only(format!(
+            "cp: cannot overwrite non-directory '{}' with directory '{}'\n",
+            dest.display(),
+            source.display()
+        ));
+    assert_eq!(at.read("dst/src/sub"), "kept");
+    assert_eq!(at.read("dst/src/other"), "other");
 }
 
 #[test]
@@ -4544,13 +4697,13 @@ fn test_cp_copy_symlink_contents_recursive() {
     at.mkdir("dest-dir");
     at.write("f", "f");
     at.relative_symlink_file("f", "slink");
-    at.relative_symlink_file("no-file", &path_concat!("src-dir", "slink"));
+    at.relative_symlink_file("no-file", &path!("src-dir", "slink"));
     ucmd.args(&["-H", "-R", "slink", "src-dir", "dest-dir"])
         .succeeds();
     assert!(at.dir_exists("src-dir"));
     assert!(at.dir_exists("dest-dir"));
-    assert!(at.dir_exists(&path_concat!("dest-dir", "src-dir")));
-    let regular_file = path_concat!("dest-dir", "slink");
+    assert!(at.dir_exists(&path!("dest-dir", "src-dir")));
+    let regular_file = path!("dest-dir", "slink");
     assert!(!at.symlink_exists(&regular_file) && at.file_exists(&regular_file));
     assert_eq!(at.read(&regular_file), "f");
 }
@@ -4762,7 +4915,7 @@ fn test_copy_dir_preserve_subdir_permissions() {
 }
 
 /// cp should successfully copy a read-only source directory containing files.
-/// Regression test: build_dir previously created the destination with the source's
+/// Regression test: `build_dir` previously created the destination with the source's
 /// read-only mode, causing EPERM when copying files into it.
 #[cfg(all(not(windows), not(target_os = "freebsd"), not(target_os = "openbsd")))]
 #[test]
@@ -5125,22 +5278,36 @@ fn test_cp_debug_multiple_default() {
     assert_eq!(result.stdout_str().matches(expected).count(), 2);
 }
 
-#[test]
 #[cfg(target_os = "linux")]
+#[rstest]
+#[case::sparse_always(
+    &["--sparse=always"],
+    "copy offload: avoided, reflink: unsupported, sparse detection: zeros"
+)]
+#[case::sparse_always_reflink_never(
+    &["--sparse=always", "--reflink=never"],
+    "copy offload: avoided, reflink: no, sparse detection: zeros"
+)]
+#[case::sparse_always_reflink_auto(
+    &["--sparse=always", "--reflink=auto"],
+    "copy offload: avoided, reflink: unsupported, sparse detection: zeros"
+)]
+#[case::sparse_never(
+    &["--sparse=never"],
+    "copy offload: avoided, reflink: no, sparse detection: no"
+)]
 #[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_sparse_reflink() {
+fn test_cp_debug_empty_file(#[case] args: &[&str], #[case] expected: &str) {
     let ts = TestScenario::new(util_name!());
-    let at = &ts.fixtures;
-    at.touch("a");
+    ts.fixtures.touch("a");
 
     ts.ucmd()
         .arg("--debug")
-        .arg("--sparse=always")
-        .arg("--reflink=never")
+        .args(args)
         .arg("a")
         .arg("b")
         .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: no, sparse detection: zeros");
+        .stdout_contains(expected);
 }
 
 #[test]
@@ -5156,40 +5323,6 @@ fn test_cp_debug_no_update() {
         .arg("b")
         .succeeds()
         .stdout_contains("skipped 'b'");
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_sparse_always() {
-    let ts = TestScenario::new(util_name!());
-    let at = &ts.fixtures;
-    at.touch("a");
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--sparse=always")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: unsupported, sparse detection: zeros");
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_sparse_never() {
-    let ts = TestScenario::new(util_name!());
-    let at = &ts.fixtures;
-    at.touch("a");
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--sparse=never")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: no, sparse detection: no");
 }
 
 #[test]
@@ -5250,23 +5383,6 @@ fn test_cp_debug_reflink_auto() {
         .arg("b")
         .succeeds()
         .stdout_contains(expected);
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_sparse_always_reflink_auto() {
-    let ts = TestScenario::new(util_name!());
-    let at = &ts.fixtures;
-    at.touch("a");
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--sparse=always")
-        .arg("--reflink=auto")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: unsupported, sparse detection: zeros");
 }
 
 #[test]
@@ -5604,237 +5720,263 @@ fn test_acl_preserve() {
     let path = at.plus_as_string(file);
     scene.ucmd().args(&["-p", &path, path2]).succeeds();
 
-    assert!(compare_xattrs(&file, &file_target));
+    assert!(compare_xattrs(file, file_target));
 }
 
-#[test]
+/// Layout of the source file copied by `test_cp_debug_sparse_source`.
 #[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Clone, Copy)]
+enum SparseSource {
+    /// No data at all, only a hole of 10000 bytes.
+    OnlyHole,
+    /// "hello" followed by a hole up to four pages.
+    DataThenHole,
+    /// A hole of four pages followed by "hello".
+    HoleThenData,
+    /// "hello" extended to 400 bytes, too small to hold a hole.
+    UnderOneBlock,
+    /// "hello" followed by that many explicitly written zeros.
+    DataThenZeros(usize),
+    /// Four pages of explicitly written zeros followed by "hello".
+    ZerosThenData,
+}
+
+/// What the destination's allocated blocks must look like after the copy.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Clone, Copy)]
+enum DestBlocks {
+    Unchecked,
+    SameAsSource,
+    OneBlock,
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[rstest]
+#[case::default_only_hole(
+    SparseSource::OnlyHole,
+    &[],
+    "copy offload: unknown, reflink: unsupported, sparse detection: SEEK_HOLE",
+    DestBlocks::SameAsSource
+)]
+#[case::default_hole_then_data(
+    SparseSource::HoleThenData,
+    &[],
+    "copy offload: yes, reflink: unsupported, sparse detection: SEEK_HOLE",
+    DestBlocks::SameAsSource
+)]
+#[case::default_under_one_block(
+    SparseSource::UnderOneBlock,
+    &["--reflink=auto", "--sparse=auto"],
+    "copy offload: yes, reflink: unsupported, sparse detection: no",
+    DestBlocks::Unchecked
+)]
+#[case::default_data_then_zeros(
+    SparseSource::DataThenZeros(10000),
+    &[],
+    "copy offload: yes, reflink: unsupported, sparse detection: no",
+    DestBlocks::Unchecked
+)]
+#[case::reflink_never_only_hole(
+    SparseSource::OnlyHole,
+    &["--reflink=never"],
+    "copy offload: unknown, reflink: no, sparse detection: SEEK_HOLE",
+    DestBlocks::SameAsSource
+)]
+#[case::reflink_never_data_then_hole(
+    SparseSource::DataThenHole,
+    &["--reflink=never"],
+    "copy offload: avoided, reflink: no, sparse detection: SEEK_HOLE",
+    DestBlocks::SameAsSource
+)]
+#[case::reflink_never_under_one_block(
+    SparseSource::UnderOneBlock,
+    &["--reflink=never"],
+    "copy offload: avoided, reflink: no, sparse detection: no",
+    DestBlocks::Unchecked
+)]
+#[case::reflink_never_data_then_zeros(
+    SparseSource::DataThenZeros(1000),
+    &["--reflink=never"],
+    "copy offload: avoided, reflink: no, sparse detection: no",
+    DestBlocks::Unchecked
+)]
+#[case::sparse_always_zeros_then_data(
+    SparseSource::ZerosThenData,
+    &["--sparse=always"],
+    "copy offload: avoided, reflink: unsupported, sparse detection: zeros",
+    DestBlocks::OneBlock
+)]
+#[case::reflink_never_sparse_always_only_hole(
+    SparseSource::OnlyHole,
+    &["--reflink=never", "--sparse=always"],
+    "copy offload: unknown, reflink: no, sparse detection: SEEK_HOLE",
+    DestBlocks::Unchecked
+)]
+#[case::reflink_never_sparse_always_data_then_hole(
+    SparseSource::DataThenHole,
+    &["--reflink=never", "--sparse=always"],
+    "copy offload: avoided, reflink: no, sparse detection: SEEK_HOLE + zeros",
+    DestBlocks::SameAsSource
+)]
+#[case::reflink_never_sparse_always_data_then_zeros(
+    SparseSource::DataThenZeros(10000),
+    &["--reflink=never", "--sparse=always"],
+    "copy offload: avoided, reflink: no, sparse detection: zeros",
+    DestBlocks::OneBlock
+)]
+#[case::reflink_never_sparse_always_zeros_then_data(
+    SparseSource::ZerosThenData,
+    &["--reflink=never", "--sparse=always"],
+    "copy offload: avoided, reflink: no, sparse detection: zeros",
+    DestBlocks::OneBlock
+)]
+#[case::reflink_never_sparse_never_only_hole(
+    SparseSource::OnlyHole,
+    &["--reflink=never", "--sparse=never"],
+    "copy offload: unknown, reflink: no, sparse detection: SEEK_HOLE",
+    DestBlocks::Unchecked
+)]
+#[case::reflink_never_sparse_never_hole_then_data(
+    SparseSource::HoleThenData,
+    &["--reflink=never", "--sparse=never"],
+    "copy offload: avoided, reflink: no, sparse detection: SEEK_HOLE",
+    DestBlocks::Unchecked
+)]
+#[case::sparse_never_only_hole(
+    SparseSource::OnlyHole,
+    &["--reflink=auto", "--sparse=never"],
+    "copy offload: unknown, reflink: no, sparse detection: SEEK_HOLE",
+    DestBlocks::Unchecked
+)]
+#[case::sparse_never_hole_then_data(
+    SparseSource::HoleThenData,
+    &["--reflink=auto", "--sparse=never"],
+    "copy offload: avoided, reflink: no, sparse detection: SEEK_HOLE",
+    DestBlocks::Unchecked
+)]
+#[case::sparse_never_under_one_block(
+    SparseSource::UnderOneBlock,
+    &["--reflink=auto", "--sparse=never"],
+    "copy offload: avoided, reflink: no, sparse detection: no",
+    DestBlocks::Unchecked
+)]
+#[case::sparse_never_data_then_zeros(
+    SparseSource::DataThenZeros(10000),
+    &["--reflink=auto", "--sparse=never"],
+    "copy offload: avoided, reflink: no, sparse detection: no",
+    DestBlocks::Unchecked
+)]
 #[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_reflink_never_with_hole() {
+fn test_cp_debug_sparse_source(
+    #[case] source: SparseSource,
+    #[case] args: &[&str],
+    #[case] expected: &str,
+    #[case] dest_blocks: DestBlocks,
+) {
     let ts = TestScenario::new(util_name!());
     let at = &ts.fixtures;
-    let page_size = rustix::param::page_size();
-    at.write("a", "hello");
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(at.plus("a"))
-        .unwrap();
-    f.set_len((page_size as u64) * 4).unwrap();
+    let four_pages = rustix::param::page_size() as u64 * 4;
+    let set_len = |len: u64| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(at.plus("a"))
+            .unwrap()
+            .set_len(len)
+            .unwrap();
+    };
+
+    match source {
+        SparseSource::OnlyHole => {
+            at.touch("a");
+            set_len(10000);
+        }
+        SparseSource::DataThenHole => {
+            at.write("a", "hello");
+            set_len(four_pages);
+        }
+        SparseSource::HoleThenData => {
+            at.touch("a");
+            set_len(four_pages);
+            at.append_bytes("a", b"hello");
+        }
+        SparseSource::UnderOneBlock => {
+            at.write("a", "hello");
+            set_len(400);
+        }
+        SparseSource::DataThenZeros(count) => {
+            at.write("a", "hello");
+            at.append_bytes("a", &vec![0; count]);
+        }
+        SparseSource::ZerosThenData => {
+            at.write_bytes("a", &vec![0; 4096 * 4]);
+            at.append_bytes("a", b"hello");
+        }
+    }
 
     ts.ucmd()
         .arg("--debug")
-        .arg("--reflink=never")
+        .args(args)
         .arg("a")
         .arg("b")
         .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: no, sparse detection: SEEK_HOLE");
+        .stdout_contains(expected);
 
-    let src_file_metadata = std::fs::metadata(at.plus("a")).unwrap();
-    let dst_file_metadata = std::fs::metadata(at.plus("b")).unwrap();
-    assert_eq!(src_file_metadata.blocks(), dst_file_metadata.blocks());
+    let dest_metadata = std::fs::metadata(at.plus("b")).unwrap();
+    match dest_blocks {
+        DestBlocks::Unchecked => {}
+        DestBlocks::SameAsSource => assert_eq!(
+            std::fs::metadata(at.plus("a")).unwrap().blocks(),
+            dest_metadata.blocks()
+        ),
+        DestBlocks::OneBlock => {
+            assert_eq!(dest_metadata.blocks(), dest_metadata.blksize() / 512);
+        }
+    }
 }
 
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_reflink_never_empty_file_with_hole() {
+#[cfg(target_os = "linux")]
+#[rstest]
+#[case::sparse_always_sparse(
+    "/sys/kernel/profiling",
+    &["--sparse=always"],
+    "copy offload: avoided, reflink: unsupported, sparse detection: SEEK_HOLE + zeros"
+)]
+#[case::default_sparse(
+    "/sys/kernel/profiling",
+    &[],
+    "copy offload: unsupported, reflink: unsupported, sparse detection: SEEK_HOLE"
+)]
+#[case::sparse_never_zero_sized(
+    "/proc/version",
+    &["--sparse=never"],
+    "copy offload: avoided, reflink: no, sparse detection: no"
+)]
+#[case::default_zero_sized(
+    "/proc/version",
+    &[],
+    "copy offload: unsupported, reflink: unsupported, sparse detection: no"
+)]
+#[cfg_attr(
+    wasi_runner,
+    ignore = "WASI: /sys and /proc virtual files are not exposed to the sandbox"
+)]
+fn test_cp_debug_virtual_file(#[case] source: &str, #[case] args: &[&str], #[case] expected: &str) {
     let ts = TestScenario::new(util_name!());
-    let at = &ts.fixtures;
-    at.touch("a");
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(at.plus("a"))
-        .unwrap();
-    f.set_len(10000).unwrap();
+
+    // /sys/kernel/profiling has been around since 2008, but a kernel built
+    // without profiling support (e.g. WSL) lacks it
+    if !ts.fixtures.file_exists(source) {
+        println!("test skipped: {source} does not exist");
+        return;
+    }
 
     ts.ucmd()
         .arg("--debug")
-        .arg("--reflink=never")
-        .arg("a")
+        .args(args)
+        .arg(source)
         .arg("b")
         .succeeds()
-        .stdout_contains("copy offload: unknown, reflink: no, sparse detection: SEEK_HOLE");
-
-    let src_file_metadata = std::fs::metadata(at.plus("a")).unwrap();
-    let dst_file_metadata = std::fs::metadata(at.plus("b")).unwrap();
-    assert_eq!(src_file_metadata.blocks(), dst_file_metadata.blocks());
-}
-
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_default_with_hole() {
-    let ts = TestScenario::new(util_name!());
-    let at = &ts.fixtures;
-    at.touch("a");
-    let page_size = rustix::param::page_size();
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(at.plus("a"))
-        .unwrap();
-    f.set_len((page_size as u64) * 4).unwrap();
-
-    at.append_bytes("a", "hello".as_bytes());
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: yes, reflink: unsupported, sparse detection: SEEK_HOLE");
-
-    let src_file_metadata = std::fs::metadata(at.plus("a")).unwrap();
-    let dst_file_metadata = std::fs::metadata(at.plus("b")).unwrap();
-    assert_eq!(src_file_metadata.blocks(), dst_file_metadata.blocks());
-}
-
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_default_less_than_512_bytes() {
-    let ts = TestScenario::new(util_name!());
-
-    let at = &ts.fixtures;
-    at.write_bytes("a", "hello".as_bytes());
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(at.plus("a"))
-        .unwrap();
-    f.set_len(400).unwrap();
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--reflink=auto")
-        .arg("--sparse=auto")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: yes, reflink: unsupported, sparse detection: no");
-}
-
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_default_without_hole() {
-    let ts = TestScenario::new(util_name!());
-
-    let at = &ts.fixtures;
-    at.write_bytes("a", "hello".as_bytes());
-
-    let filler_bytes = [0_u8; 10000];
-
-    at.append_bytes("a", &filler_bytes);
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: yes, reflink: unsupported, sparse detection: no");
-}
-
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_default_empty_file_with_hole() {
-    let ts = TestScenario::new(util_name!());
-    let at = &ts.fixtures;
-    at.touch("a");
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(at.plus("a"))
-        .unwrap();
-    f.set_len(10000).unwrap();
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains(
-            "copy offload: unknown, reflink: unsupported, sparse detection: SEEK_HOLE",
-        );
-
-    let src_file_metadata = std::fs::metadata(at.plus("a")).unwrap();
-    let dst_file_metadata = std::fs::metadata(at.plus("b")).unwrap();
-    assert_eq!(src_file_metadata.blocks(), dst_file_metadata.blocks());
-}
-
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_reflink_never_sparse_always_with_hole() {
-    let ts = TestScenario::new(util_name!());
-    let at = &ts.fixtures;
-    let page_size = rustix::param::page_size();
-    at.write("a", "hello");
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(at.plus("a"))
-        .unwrap();
-    f.set_len((page_size as u64) * 4).unwrap();
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--reflink=never")
-        .arg("--sparse=always")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: no, sparse detection: SEEK_HOLE + zeros");
-
-    let src_file_metadata = std::fs::metadata(at.plus("a")).unwrap();
-    let dst_file_metadata = std::fs::metadata(at.plus("b")).unwrap();
-    assert_eq!(src_file_metadata.blocks(), dst_file_metadata.blocks());
-}
-
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_reflink_never_sparse_always_without_hole() {
-    let ts = TestScenario::new(util_name!());
-    let empty_bytes = [0_u8; 10000];
-    let at = &ts.fixtures;
-    at.write("a", "hello");
-    at.append_bytes("a", &empty_bytes);
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--reflink=never")
-        .arg("--sparse=always")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: no, sparse detection: zeros");
-
-    let dst_file_metadata = std::fs::metadata(at.plus("b")).unwrap();
-    assert_eq!(
-        dst_file_metadata.blocks(),
-        dst_file_metadata.blksize() / 512
-    );
-}
-
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_reflink_never_sparse_always_empty_file_with_hole() {
-    let ts = TestScenario::new(util_name!());
-    let at = &ts.fixtures;
-    at.touch("a");
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(at.plus("a"))
-        .unwrap();
-    f.set_len(10000).unwrap();
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--reflink=never")
-        .arg("--sparse=always")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: unknown, reflink: no, sparse detection: SEEK_HOLE");
+        .stdout_contains(expected);
 }
 
 #[test]
@@ -5864,316 +6006,6 @@ fn test_cp_default_virtual_file() {
         .size();
     assert!(dest_size > 0);
 }
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_reflink_auto_sparse_always_non_sparse_file_with_long_zero_sequence() {
-    let ts = TestScenario::new(util_name!());
-
-    let buf: Vec<u8> = vec![0; 4096 * 4];
-    let at = &ts.fixtures;
-    at.touch("a");
-    at.append_bytes("a", &buf);
-    at.append_bytes("a", "hello".as_bytes());
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--sparse=always")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: unsupported, sparse detection: zeros");
-
-    let dst_file_metadata = std::fs::metadata(at.plus("b")).unwrap();
-    assert_eq!(
-        dst_file_metadata.blocks(),
-        dst_file_metadata.blksize() / 512
-    );
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_sparse_never_empty_sparse_file() {
-    let ts = TestScenario::new(util_name!());
-    let at = &ts.fixtures;
-    at.touch("a");
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--sparse=never")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: no, sparse detection: no");
-}
-
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_reflink_never_sparse_always_non_sparse_file_with_long_zero_sequence() {
-    let ts = TestScenario::new(util_name!());
-
-    let buf: Vec<u8> = vec![0; 4096 * 4];
-    let at = &ts.fixtures;
-    at.touch("a");
-    at.append_bytes("a", &buf);
-    at.append_bytes("a", "hello".as_bytes());
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--reflink=never")
-        .arg("--sparse=always")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: no, sparse detection: zeros");
-
-    let dst_file_metadata = std::fs::metadata(at.plus("b")).unwrap();
-    assert_eq!(
-        dst_file_metadata.blocks(),
-        dst_file_metadata.blksize() / 512
-    );
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-#[cfg_attr(
-    wasi_runner,
-    ignore = "WASI: /sys and /proc virtual files are not exposed to the sandbox"
-)]
-fn test_cp_debug_sparse_always_sparse_virtual_file() {
-    // This file has existed at least since 2008, so we assume that it is present on "all" Linux kernels.
-    // https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-profiling
-    let ts = TestScenario::new(util_name!());
-
-    // in case the kernel was not built with profiling support, e.g. WSL
-    if !ts.fixtures.file_exists("/sys/kernel/profiling") {
-        println!("test skipped: /sys/kernel/profiling does not exist");
-        return;
-    }
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--sparse=always")
-        .arg("/sys/kernel/profiling")
-        .arg("b")
-        .succeeds()
-        .stdout_contains(
-            "copy offload: avoided, reflink: unsupported, sparse detection: SEEK_HOLE + zeros",
-        );
-}
-
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_reflink_never_less_than_512_bytes() {
-    let ts = TestScenario::new(util_name!());
-
-    let at = &ts.fixtures;
-    at.write_bytes("a", "hello".as_bytes());
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(at.plus("a"))
-        .unwrap();
-    f.set_len(400).unwrap();
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--reflink=never")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: no, sparse detection: no");
-}
-
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_reflink_never_sparse_never_empty_file_with_hole() {
-    let ts = TestScenario::new(util_name!());
-    let at = &ts.fixtures;
-    at.touch("a");
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(at.plus("a"))
-        .unwrap();
-    f.set_len(10000).unwrap();
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--reflink=never")
-        .arg("--sparse=never")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: unknown, reflink: no, sparse detection: SEEK_HOLE");
-}
-
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_reflink_never_file_with_hole() {
-    let ts = TestScenario::new(util_name!());
-    let at = &ts.fixtures;
-    at.touch("a");
-    let page_size = rustix::param::page_size();
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(at.plus("a"))
-        .unwrap();
-    f.set_len((page_size as u64) * 4).unwrap();
-    at.append_bytes("a", b"hello");
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--reflink=never")
-        .arg("--sparse=never")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: no, sparse detection: SEEK_HOLE");
-}
-
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_sparse_never_less_than_512_bytes() {
-    let ts = TestScenario::new(util_name!());
-
-    let at = &ts.fixtures;
-    at.write_bytes("a", "hello".as_bytes());
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(at.plus("a"))
-        .unwrap();
-    f.set_len(400).unwrap();
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--reflink=auto")
-        .arg("--sparse=never")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: no, sparse detection: no");
-}
-
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_sparse_never_without_hole() {
-    let ts = TestScenario::new(util_name!());
-
-    let at = &ts.fixtures;
-    at.write_bytes("a", "hello".as_bytes());
-
-    let filler_bytes = [0_u8; 10000];
-
-    at.append_bytes("a", &filler_bytes);
-
-    ts.ucmd()
-        .arg("--reflink=auto")
-        .arg("--sparse=never")
-        .arg("--debug")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: no, sparse detection: no");
-}
-
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_sparse_never_empty_file_with_hole() {
-    let ts = TestScenario::new(util_name!());
-    let at = &ts.fixtures;
-    at.touch("a");
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(at.plus("a"))
-        .unwrap();
-    f.set_len(10000).unwrap();
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--reflink=auto")
-        .arg("--sparse=never")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: unknown, reflink: no, sparse detection: SEEK_HOLE");
-}
-
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_sparse_never_file_with_hole() {
-    let ts = TestScenario::new(util_name!());
-    let at = &ts.fixtures;
-    let page_size = rustix::param::page_size();
-    at.touch("a");
-    let f = std::fs::OpenOptions::new()
-        .write(true)
-        .open(at.plus("a"))
-        .unwrap();
-    f.set_len((page_size as u64) * 4).unwrap();
-    at.append_bytes("a", "hello".as_bytes());
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--reflink=auto")
-        .arg("--sparse=never")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: no, sparse detection: SEEK_HOLE");
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-#[cfg_attr(
-    wasi_runner,
-    ignore = "WASI: /sys and /proc virtual files are not exposed to the sandbox"
-)]
-fn test_cp_debug_default_sparse_virtual_file() {
-    // This file has existed at least since 2008, so we assume that it is present on "all" Linux kernels.
-    // https://www.kernel.org/doc/Documentation/ABI/testing/sysfs-profiling
-    let ts = TestScenario::new(util_name!());
-
-    // in case the kernel was not built with profiling support, e.g. WSL
-    if !ts.fixtures.file_exists("/sys/kernel/profiling") {
-        println!("test skipped: /sys/kernel/profiling does not exist");
-        return;
-    }
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("/sys/kernel/profiling")
-        .arg("b")
-        .succeeds()
-        .stdout_contains(
-            "copy offload: unsupported, reflink: unsupported, sparse detection: SEEK_HOLE",
-        );
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-#[cfg_attr(
-    wasi_runner,
-    ignore = "WASI: /sys and /proc virtual files are not exposed to the sandbox"
-)]
-fn test_cp_debug_sparse_never_zero_sized_virtual_file() {
-    let ts = TestScenario::new(util_name!());
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--sparse=never")
-        .arg("/proc/version")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: no, sparse detection: no");
-}
-
 // A file that stats as zero-sized but still returns data (/proc entries)
 // is probed for content by reading from it. The copy reuses that same
 // descriptor, so it has to start over at offset 0 -- otherwise everything
@@ -6204,41 +6036,6 @@ fn test_cp_zero_sized_virtual_file_contents() {
             .no_output();
         assert_eq!(at.read("copied"), expected, "with {extra:?}");
     }
-}
-
-#[test]
-#[cfg(target_os = "linux")]
-#[cfg_attr(
-    wasi_runner,
-    ignore = "WASI: /sys and /proc virtual files are not exposed to the sandbox"
-)]
-fn test_cp_debug_default_zero_sized_virtual_file() {
-    let ts = TestScenario::new(util_name!());
-    ts.ucmd()
-        .arg("--debug")
-        .arg("/proc/version")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: unsupported, reflink: unsupported, sparse detection: no");
-}
-
-#[test]
-#[cfg(any(target_os = "linux", target_os = "android"))]
-#[cfg_attr(wasi_runner, ignore = "WASI: --sparse is only supported on linux")]
-fn test_cp_debug_reflink_never_without_hole() {
-    let ts = TestScenario::new(util_name!());
-    let filler_bytes = [0_u8; 1000];
-    let at = &ts.fixtures;
-    at.write("a", "hello");
-    at.append_bytes("a", &filler_bytes);
-
-    ts.ucmd()
-        .arg("--debug")
-        .arg("--reflink=never")
-        .arg("a")
-        .arg("b")
-        .succeeds()
-        .stdout_contains("copy offload: avoided, reflink: no, sparse detection: no");
 }
 
 #[test]
@@ -7639,7 +7436,7 @@ fn test_dir_perm_race_with_preserve_mode_and_ownership() {
             }
             sleep(Duration::from_millis(100));
         }
-        let mode = at.metadata(&format!("{DEST_DIR}/{SRC_DIR}")).mode();
+        let mode = at.metadata(format!("{DEST_DIR}/{SRC_DIR}")).mode();
         #[allow(clippy::unnecessary_cast, clippy::cast_lossless)]
         let mask = if attr == "mode" {
             libc::S_IWGRP | libc::S_IWOTH
@@ -7710,15 +7507,15 @@ fn test_preserve_attrs_overriding_2() {
         let scene = TestScenario::new(util_name!());
         let at = &scene.fixtures;
         at.mkdir(FOLDER);
-        at.make_file(&format!("{FOLDER}/{FILE1}"));
-        at.set_mode(&format!("{FOLDER}/{FILE1}"), 0o775);
-        at.hard_link(&format!("{FOLDER}/{FILE1}"), &format!("{FOLDER}/{FILE2}"));
+        at.make_file(format!("{FOLDER}/{FILE1}"));
+        at.set_mode(format!("{FOLDER}/{FILE1}"), 0o775);
+        at.hard_link(format!("{FOLDER}/{FILE1}"), format!("{FOLDER}/{FILE2}"));
         args.append(&mut vec![FOLDER, DEST]);
-        let src_file1_metadata = at.metadata(&format!("{FOLDER}/{FILE1}"));
+        let src_file1_metadata = at.metadata(format!("{FOLDER}/{FILE1}"));
         scene.ucmd().args(&args).succeeds();
         at.dir_exists(DEST);
-        let dest_file1_metadata = at.metadata(&format!("{DEST}/{FILE1}"));
-        let dest_file2_metadata = at.metadata(&format!("{DEST}/{FILE2}"));
+        let dest_file1_metadata = at.metadata(format!("{DEST}/{FILE1}"));
+        let dest_file2_metadata = at.metadata(format!("{DEST}/{FILE2}"));
         assert_eq!(
             src_file1_metadata.modified().unwrap(),
             dest_file1_metadata.modified().unwrap()
@@ -7939,8 +7736,12 @@ fn test_copy_symlink_overwrite() {
     at.mkdir("c");
 
     at.write("t", "hello");
-    at.relative_symlink_file("../t", "a/1");
-    at.relative_symlink_file("../t", "b/1");
+
+    let parent_t = &path!("..", "t");
+    let a_one = path!("a", "1");
+    let b_one = path!("b", "1");
+    at.relative_symlink_file(parent_t, a_one);
+    at.relative_symlink_file(parent_t, b_one);
 
     ucmd.arg("--no-dereference")
         .arg("a/1")
@@ -8062,7 +7863,7 @@ fn test_cp_preserve_xattr_readonly_source() {
     }
 
     let getfattr_output = Command::new("getfattr")
-        .args([&at.plus_as_string(source_file)])
+        .args([&at.plus(source_file)])
         .output()
         .expect("Failed to run `getfattr` on the destination file");
 
@@ -8099,7 +7900,7 @@ fn test_cp_preserve_xattr_readonly_source() {
 
     assert!(scene.fixtures.metadata(dest_file).permissions().readonly());
     assert!(
-        compare_xattrs(&at.plus(source_file), &at.plus(dest_file)),
+        compare_xattrs(at.plus(source_file), at.plus(dest_file)),
         "Extended attributes were not preserved"
     );
 }
@@ -8123,7 +7924,7 @@ fn test_cp_archive_preserves_directory_permissions() {
         let path = format!("test-images/{subdir}");
         at.mkdir(&path);
         at.set_mode(&path, mode);
-        at.write(&format!("{path}/test{}.txt", i + 1), "test content");
+        at.write(format!("{path}/test{}.txt", i + 1), "test content");
     }
 
     ucmd.arg("-a")
@@ -8280,6 +8081,42 @@ fn test_cp_from_stream_permission() {
 }
 
 #[test]
+fn test_cp_context_without_selinux() {
+    #[cfg(all(feature = "selinux", any(target_os = "linux", target_os = "android")))]
+    if uucore::selinux::is_selinux_enabled() {
+        println!("Test skipped: SELinux is enabled");
+        return;
+    }
+
+    let warning = "cp: warning: ignoring --context; it requires an SELinux-enabled kernel\n";
+    for (arg, stderr) in [
+        ("--context=con", warning),
+        ("--context=", warning),
+        ("--context", ""),
+        ("-Z", ""),
+    ] {
+        let scene = TestScenario::new(util_name!());
+        scene.fixtures.mkdir("source");
+        scene.fixtures.write("source/file", "copied data");
+        scene
+            .ucmd()
+            .args(&[arg, "source/file", "dest"])
+            .succeeds()
+            .no_stdout()
+            .stderr_is(stderr);
+        assert_eq!(scene.fixtures.read("dest"), "copied data");
+
+        scene
+            .ucmd()
+            .args(&[arg, "-R", "source", "tree"])
+            .succeeds()
+            .no_stdout()
+            .stderr_is(stderr);
+        assert_eq!(scene.fixtures.read("tree/file"), "copied data");
+    }
+}
+
+#[test]
 #[cfg(all(feature = "selinux", any(target_os = "linux", target_os = "android")))]
 fn test_cp_selinux() {
     let ts = TestScenario::new(util_name!());
@@ -8300,7 +8137,7 @@ fn test_cp_selinux() {
             selinux_perm.contains("unconfined_u"),
             "Expected 'foo' not found in getfattr output:\n{selinux_perm}"
         );
-        at.remove(&at.plus_as_string(TEST_HELLO_WORLD_DEST));
+        at.remove(at.plus(TEST_HELLO_WORLD_DEST));
     }
 }
 
@@ -8310,7 +8147,6 @@ fn test_cp_selinux_default_context_relative_dest() {
     // -Z labels the destination with the context the policy has for its path,
     // and the policy only lists absolute paths: a relative destination used to
     // match nothing and silently keep the context it already carried.
-    use std::path::Path;
     use uucore::selinux::set_selinux_security_context;
 
     let ts = TestScenario::new(util_name!());
@@ -8323,7 +8159,7 @@ fn test_cp_selinux_default_context_relative_dest() {
     let ctx = "root:object_r:etc_t:s0".to_string();
     for dest in ["relative", "absolute"] {
         at.touch(dest);
-        if set_selinux_security_context(Path::new(&at.plus_as_string(dest)), Some(&ctx)).is_err() {
+        if set_selinux_security_context(&at.plus(dest), Some(&ctx)).is_err() {
             return;
         }
     }
@@ -8403,7 +8239,7 @@ fn test_cp_preserve_selinux() {
             assert_metadata_eq!(metadata_src, metadata_dst);
         }
 
-        at.remove(&at.plus_as_string(TEST_HELLO_WORLD_DEST));
+        at.remove(at.plus_as_string(TEST_HELLO_WORLD_DEST));
     }
 }
 
@@ -8419,7 +8255,7 @@ fn test_cp_preserve_selinux_admin_context() {
     // On Debian/Ubuntu, this program is provided by the selinux-utils package
     // On Fedora/RHEL, this program is provided by the libselinux-devel package
     let output = std::process::Command::new("matchpathcon")
-        .arg(at.plus_as_string(TEST_HELLO_WORLD_DEST))
+        .arg(at.plus(TEST_HELLO_WORLD_DEST))
         .output()
         .expect("failed to execute matchpathcon command");
 
@@ -8463,7 +8299,7 @@ fn test_cp_preserve_selinux_admin_context() {
 
     assert_eq!(default_context, selinux_perm_dest);
 
-    at.remove(&at.plus_as_string(TEST_HELLO_WORLD_DEST));
+    at.remove(at.plus(TEST_HELLO_WORLD_DEST));
 }
 
 #[test]
@@ -8661,7 +8497,7 @@ fn test_cp_preserve_context_root() {
 
     let chcon_result = std::process::Command::new("chcon")
         .arg(context)
-        .arg(at.plus_as_string(source_file))
+        .arg(at.plus(source_file))
         .status();
 
     if !chcon_result.is_ok_and(|status| status.success()) {
@@ -9282,7 +9118,7 @@ fn test_cp_archive_deref_flag_ordering() {
 }
 
 /// Regression test: -a keeps recursion when combined with -L/-H/-d.
-/// https://github.com/uutils/coreutils/issues/13207
+/// <https://github.com/uutils/coreutils/issues/13207>
 #[test]
 #[cfg(unix)]
 #[cfg_attr(
@@ -9358,7 +9194,7 @@ fn test_cp_archive_deref_symlinks_inside_dir() {
     let at = &scene.fixtures;
     at.mkdir("srcdir");
     at.touch("srcdir/real.txt");
-    symlink("real.txt", at.plus_as_string("srcdir/link.txt")).unwrap();
+    symlink("real.txt", at.plus("srcdir/link.txt")).unwrap();
 
     // -a (no deref): inner symlinks preserved
     scene.ucmd().args(&["-a", "srcdir", "dest_a"]).succeeds();
@@ -9395,7 +9231,7 @@ fn test_cp_archive_cli_deref_inner_preserved() {
     let at = &scene.fixtures;
     at.mkdir("srcdir");
     at.touch("srcdir/real.txt");
-    symlink("real.txt", at.plus_as_string("srcdir/link.txt")).unwrap();
+    symlink("real.txt", at.plus("srcdir/link.txt")).unwrap();
 
     // -aH: CLI symlink dereferenced, inner symlinks preserved
     scene.ucmd().args(&["-aH", "srcdir", "dest_aH"]).succeeds();
@@ -9425,7 +9261,7 @@ fn test_cp_archive_deref_repeated_flag_last_wins() {
     let at = &scene.fixtures;
     at.mkdir("srcdir");
     at.touch("srcdir/real.txt");
-    symlink("real.txt", at.plus_as_string("srcdir/link.txt")).unwrap();
+    symlink("real.txt", at.plus("srcdir/link.txt")).unwrap();
 
     // -aL -a: -a is last, inner symlinks preserved
     scene
@@ -9477,7 +9313,7 @@ fn test_cp_circular_symbolic_links_in_directory() {
         ));
 }
 
-/// Test that copying to an existing file maintains its permissions, unix only because .mode() only
+/// Test that copying to an existing file maintains its permissions, unix only because `.mode()` only
 /// works on Unix
 #[test]
 #[cfg(unix)]
@@ -9811,14 +9647,13 @@ fn test_cp_gnu_preserve_mode() {
 #[cfg(all(feature = "selinux", any(target_os = "linux", target_os = "android")))]
 fn test_cp_a_z_overrides_context() {
     // Verifies -aZ succeeds (-Z overrides implicit --preserve=context from -a)
-    use std::path::Path;
     use uucore::selinux::set_selinux_security_context;
 
     let (at, mut ucmd) = at_and_ucmd!();
     at.touch("src");
 
     let ctx = "unconfined_u:object_r:user_tmp_t:s0".to_string();
-    if set_selinux_security_context(Path::new(&at.plus_as_string("src")), Some(&ctx)).is_err() {
+    if set_selinux_security_context(&at.plus("src"), Some(&ctx)).is_err() {
         return;
     }
 
@@ -9828,22 +9663,19 @@ fn test_cp_a_z_overrides_context() {
 #[test]
 #[cfg(all(feature = "selinux", any(target_os = "linux", target_os = "android")))]
 fn test_cp_a_preserves_context() {
-    use std::path::Path;
     use uucore::selinux::{get_selinux_security_context, set_selinux_security_context};
 
     let (at, mut ucmd) = at_and_ucmd!();
     at.touch("src");
 
     let ctx = "unconfined_u:object_r:user_tmp_t:s0".to_string();
-    if set_selinux_security_context(Path::new(&at.plus_as_string("src")), Some(&ctx)).is_err() {
+    if set_selinux_security_context(&at.plus("src"), Some(&ctx)).is_err() {
         return;
     }
 
-    let src_ctx =
-        get_selinux_security_context(Path::new(&at.plus_as_string("src")), false).unwrap();
+    let src_ctx = get_selinux_security_context(&at.plus("src"), false).unwrap();
     ucmd.args(&["-a", "src", "dst"]).succeeds();
-    let dst_ctx =
-        get_selinux_security_context(Path::new(&at.plus_as_string("dst")), false).unwrap();
+    let dst_ctx = get_selinux_security_context(&at.plus("dst"), false).unwrap();
 
     assert_eq!(src_ctx, dst_ctx, "-a should preserve SELinux context");
 }
@@ -9851,11 +9683,13 @@ fn test_cp_a_preserves_context() {
 #[test]
 #[cfg(all(feature = "selinux", any(target_os = "linux", target_os = "android")))]
 fn test_cp_preserve_context_with_z_fails() {
-    let (at, mut ucmd) = at_and_ucmd!();
-    at.touch("src");
-    ucmd.args(&["--preserve=context", "-Z", "src", "dst"])
-        .fails()
-        .stderr_contains("cannot combine");
+    for arg in ["-Z", "--context"] {
+        let (at, mut ucmd) = at_and_ucmd!();
+        at.touch("src");
+        ucmd.args(&["--preserve=context", arg, "src", "dst"])
+            .fails()
+            .stderr_contains("cannot combine");
+    }
 }
 
 // Covers the happy path for issue #9750: when chown succeeds (src owner ==

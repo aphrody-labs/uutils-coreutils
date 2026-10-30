@@ -34,7 +34,7 @@ fn get_symlink_times(at: &AtPath, path: &str) -> (FileTime, FileTime) {
 }
 
 fn set_file_times(at: &AtPath, path: &str, atime: FileTime, mtime: FileTime) {
-    filetime::set_file_times(at.plus_as_string(path), atime, mtime).unwrap();
+    filetime::set_file_times(at.plus(path), atime, mtime).unwrap();
 }
 
 fn str_to_filetime(format: &str, s: &str) -> FileTime {
@@ -356,6 +356,27 @@ fn test_touch_set_both_offset_date_and_reference() {
 }
 
 #[test]
+fn test_touch_offset_date_against_reference_with_different_atime_mtime() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    let ref_file = "test_touch_reference_different_atime_mtime";
+    let file = "test_touch_offset_date_different_atime_mtime";
+
+    let ref_atime = str_to_filetime("%Y%m%d%H%M", "201501011234");
+    let ref_mtime = str_to_filetime("%Y%m%d%H%M", "201502021234");
+
+    at.touch(ref_file);
+    set_file_times(&at, ref_file, ref_atime, ref_mtime);
+
+    // Each result is offset from its own reference time.
+    ucmd.args(&["-d", "+1 day", "-r", ref_file, file])
+        .succeeds()
+        .no_stderr();
+    let (atime, mtime) = get_file_times(&at, file);
+    assert_eq!(atime, str_to_filetime("%Y%m%d%H%M", "201501021234"));
+    assert_eq!(mtime, str_to_filetime("%Y%m%d%H%M", "201502031234"));
+}
+
+#[test]
 fn test_touch_set_both_time_and_date() {
     let file = "test_touch_set_both_time_and_date";
 
@@ -647,7 +668,7 @@ fn test_touch_set_date_without_leading_zeroes() {
     assert_eq!(mtime, expected);
 }
 
-/// Regression test for https://github.com/uutils/coreutils/issues/11804
+/// Regression test for <https://github.com/uutils/coreutils/issues/11804>
 ///
 /// Setting a pre-epoch date like `0000-01-01` used to panic on 32-bit targets
 /// because the i64 Unix timestamp (~-62 billion) overflowed the i32 `tv_sec`
@@ -843,6 +864,20 @@ fn test_touch_explicit_time_on_root_owned_file_eperm() {
         .args(&["-d", "2000-01-01", "/"])
         .fails()
         .stderr_only("touch: setting times of '/': Operation not permitted\n");
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+#[cfg_attr(wasi_runner, ignore = "WASI sandbox: host paths not visible")]
+fn test_touch_date_now_on_writable_file_owned_by_other() {
+    // /dev/null is root-owned but writable, so `-d now` needs only write permission (#15019).
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    new_ucmd!()
+        .args(&["-d", "now", "/dev/null"])
+        .succeeds()
+        .no_output();
 }
 
 #[test]

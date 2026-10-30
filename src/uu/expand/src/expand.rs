@@ -8,7 +8,7 @@
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write, stdin, stdout};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write, stdin, stdout};
 use std::num::IntErrorKind;
 use std::path::Path;
 use std::str::from_utf8;
@@ -92,8 +92,12 @@ fn tabstops_parse(s: &str) -> Result<(RemainingMode, Vec<usize>), ParseError> {
                     match s.parse::<usize>() {
                         // Tab size must be positive.
                         Ok(0) => return Err(ParseError::TabSizeCannotBeZero),
-                        // Tab sizes must be ascending.
-                        Ok(num) if nums.last().is_some_and(|last| *last >= num) => {
+                        // Tab stops must be ascending. A number after `/` or `+` is a
+                        // tab size for the remaining columns, not a tab stop.
+                        Ok(num)
+                            if remaining_mode == RemainingMode::None
+                                && nums.last().is_some_and(|last| *last >= num) =>
+                        {
                             return Err(ParseError::TabSizesMustBeAscending);
                         }
                         Ok(num) => {
@@ -189,11 +193,12 @@ fn expand_shortcuts(args: Vec<OsString>) -> Vec<OsString> {
     let mut processed_args = Vec::with_capacity(args.len());
 
     for arg in args {
-        if let Some(arg) = arg.to_str()
-            && arg.starts_with('-')
-            && arg[1..].chars().all(is_digit_or_comma)
+        if let Some(shortcut) = arg
+            .to_str()
+            .and_then(|arg| arg.strip_prefix('-'))
+            .filter(|shortcut| !shortcut.is_empty() && shortcut.chars().all(is_digit_or_comma))
         {
-            arg[1..]
+            shortcut
                 .split(',')
                 .filter(|s| !s.is_empty())
                 .for_each(|s| processed_args.push(OsString::from(format!("--tabs={s}"))));
@@ -444,16 +449,17 @@ fn expand_file(
     output: &mut BufWriter<std::io::Stdout>,
     options: &Options,
 ) -> UResult<()> {
-    let mut buf = [0u8; 4096];
     let mut input = open(file)?;
     let ts = options.tabstops.as_ref();
     let mut col = 0;
     loop {
-        match input.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                expand_buf(&buf[..n], output, ts, options, &mut col)
+        match input.fill_buf() {
+            Ok([]) => break,
+            Ok(buf) => {
+                expand_buf(buf, output, ts, options, &mut col)
                     .map_err_context(|| translate!("expand-error-failed-to-write-output"))?;
+                let len = buf.len();
+                input.consume(len);
             }
             Err(e) => return Err(e.map_err_context(|| file.maybe_quote().to_string())),
         }

@@ -634,14 +634,55 @@ fn test_check_space_star_or_not() {
             d41d8cd98f00b204e9800998ecf8427e *c\n",
     );
 
-    // First should fail as *empty doesn't exit
+    // The first line fixes the single-space format, so "*" belongs to the file name.
     scene
         .ccmd("md5sum")
         .arg("--check")
         .arg("in.md5")
         .succeeds()
         .stdout_contains("a: OK")
-        .stderr_contains("WARNING: 1 line is improperly formatted");
+        .stdout_contains("'*c': OK")
+        .no_stderr();
+}
+
+#[test]
+fn test_check_line_without_file_name() {
+    let scene = TestScenario::new(util_name!());
+    let digest = "d41d8cd98f00b204e9800998ecf8427e";
+
+    for line in [
+        format!("{digest} "),
+        format!(" {digest} "),
+        format!("{digest}\t"),
+    ] {
+        scene
+            .ccmd("md5sum")
+            .arg("--check")
+            .pipe_in(format!("{line}\n"))
+            .fails()
+            .no_stdout()
+            .stderr_contains("no properly formatted checksum lines found");
+    }
+}
+
+#[test]
+fn test_check_empty_file_name_does_not_set_format() {
+    let scene = TestScenario::new(util_name!());
+    scene.fixtures.touch("a");
+    let digest = "d41d8cd98f00b204e9800998ecf8427e";
+
+    for input in [
+        format!("{digest}\t\n{digest}  a\n"),
+        format!("{digest} a\n{digest}\t\n"),
+    ] {
+        scene
+            .ccmd("md5sum")
+            .arg("--check")
+            .pipe_in(input)
+            .succeeds()
+            .stdout_is("a: OK\n")
+            .stderr_is("md5sum: WARNING: 1 line is improperly formatted\n");
+    }
 }
 
 #[test]
@@ -900,4 +941,49 @@ fn test_read_error_does_not_stop_other_files() {
         .fails_with_code(1)
         .stdout_is("b1946ac92492d2347c6235b4d2611184  f\n")
         .stderr_is("md5sum: /proc/self/mem: Input/output error\n");
+}
+
+#[test]
+#[cfg(not(windows))]
+fn test_numeric_looking_file_names_are_kept_verbatim() {
+    // File names such as "007" or "1e3" must not be reformatted as numbers
+    // in error messages.
+    let scene = TestScenario::new(util_name!());
+    let at = &scene.fixtures;
+    at.mkdir("007");
+    at.mkdir("1e3");
+    scene
+        .ucmd()
+        .args(&["007", "1e3"])
+        .fails_with_code(1)
+        .stderr_is("md5sum: 007: Is a directory\nmd5sum: 1e3: Is a directory\n");
+
+    at.write("2.50", "d41d8cd98f00b204e9800998ecf8427e  missing\n");
+    scene
+        .ucmd()
+        .args(&["--check", "--ignore-missing", "2.50"])
+        .fails_with_code(1)
+        .stderr_is("md5sum: 2.50: no file was verified\n");
+
+    at.write("1.0", "not a checksum line\n");
+    scene
+        .ucmd()
+        .args(&["--check", "1.0"])
+        .fails_with_code(1)
+        .stderr_is("md5sum: 1.0: no properly formatted checksum lines found\n");
+
+    at.touch("empty");
+    at.write(
+        "3.0",
+        "not a checksum line\nd41d8cd98f00b204e9800998ecf8427e  empty\n",
+    );
+    scene
+        .ucmd()
+        .args(&["--check", "--warn", "3.0"])
+        .succeeds()
+        .stdout_is("empty: OK\n")
+        .stderr_is(
+            "md5sum: 3.0: 1: improperly formatted MD5 checksum line\n\
+             md5sum: WARNING: 1 line is improperly formatted\n",
+        );
 }
